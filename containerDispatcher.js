@@ -26,6 +26,13 @@ const { dispatchToWorker, WORKER_BASE_URL } = require('./workerClient');
 const IS_PROD = process.env.NODE_ENV === 'production';
 const K       = parseInt(process.env.CONTAINERS_PER_SERVER, 10) || 50;
 
+if (IS_PROD && !process.env.WORKER_BASE_URL) {
+  console.warn('[ContainerDispatcher] ⚠️  NODE_ENV=production but WORKER_BASE_URL is not set. Remote dispatch may fail.');
+}
+if (!IS_PROD) {
+  console.log('[ContainerDispatcher] ℹ️  Running in DEVELOPMENT mode — containers will be launched locally via exec().');
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
