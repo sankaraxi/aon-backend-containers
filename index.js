@@ -1085,10 +1085,10 @@ const upload = multer({ storage });
 });
 
   app.post('/v2/run-Assesment', async (req, res) => {
-    const { userId, framework, outputPort } = req.body;
-    console.log(`[${userId}] 🏃 Run Assessment (Q3) triggered — framework=${framework}, port=${outputPort}`);
+    const { userId, framework, outputPort, serverNumber } = req.body;
+    console.log(`[${userId}] 🏃 Run Assessment (Q3) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
     try {
-      const results = await a1l1q3(userId,framework, outputPort);
+      const results = await a1l1q3(userId,framework, outputPort, serverNumber || 1);
       
       res.json({ detailedResults: results });
 
@@ -1143,10 +1143,10 @@ const upload = multer({ storage });
   });
 
   app.post('/v2/run-Assesment-2', async (req, res) => {
-    const { userId, framework, outputPort } = req.body;
-    console.log(`[${userId}] 🏃 Run Assessment (Q2) triggered — framework=${framework}, port=${outputPort}`);
+    const { userId, framework, outputPort, serverNumber } = req.body;
+    console.log(`[${userId}] 🏃 Run Assessment (Q2) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
     try {
-      const results = await a1l1q2(userId,framework, outputPort);
+      const results = await a1l1q2(userId,framework, outputPort, serverNumber || 1);
       res.json({ detailedResults: results });
 
       const overallResult = calculateOverallScores(results);
@@ -1201,10 +1201,10 @@ const upload = multer({ storage });
   });
 
   app.post('/v2/run-Assesment-1', async (req, res) => {
-    const { userId, framework, outputPort } = req.body;
-    console.log(`[${userId}] 🏃 Run Assessment (Q1) triggered — framework=${framework}, port=${outputPort}`);
+    const { userId, framework, outputPort, serverNumber } = req.body;
+    console.log(`[${userId}] 🏃 Run Assessment (Q1) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
     try {
-      const results = await a1l1q1(userId,framework, outputPort);
+      const results = await a1l1q1(userId,framework, outputPort, serverNumber || 1);
       res.json({ detailedResults: results });
       
       const overallResult = calculateOverallScores(results);
