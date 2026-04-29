@@ -12,7 +12,6 @@ const { a1l1q2 } = require("./A1L1RQ02.js");
 const { a1l1q1 } = require("./A1L1RQ01.js");
 const { a1l1q3 } = require('./A1L1RQ03.js');
 const { calculateOverallScores } = require("./calculateOverallScores.js");
-const { dispatchContainer, IS_PROD, K } = require('./containerDispatcher');
 const axios = require("axios");
 const { exec } = require('child_process');
 
@@ -31,6 +30,165 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-change-in-prod';
 
 const BASIC_AUTH_USER = process.env.BASIC_AUTH_USER;
 const BASIC_AUTH_PASS = process.env.BASIC_AUTH_PASS;
+const CONTAINER_WORKSPACE_FOLDER = '/home/coder/project';
+
+function normalizeBaseUrl(baseUrl) {
+  return (baseUrl || '').trim().replace(/\/+$/, '');
+}
+
+function isProductionContainerRouting() {
+  const mode = (process.env.CONTAINER_ROUTING_MODE || process.env.NODE_ENV || 'development').toLowerCase();
+  return mode === 'production';
+}
+
+function getContainersPerServer() {
+  const parsed = Number.parseInt(
+    process.env.CONTAINERS_PER_SERVER || process.env.CONTAINER_BUCKET_SIZE || '1',
+    10
+  );
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function getContainerServerNumber(containerOrdinal) {
+  const ordinal = Number(containerOrdinal);
+  if (!isProductionContainerRouting()) return 1;
+  if (!Number.isFinite(ordinal) || ordinal < 1) return 1;
+  return Math.floor((ordinal - 1) / getContainersPerServer()) + 1;
+}
+
+function applyTemplate(template, values) {
+  if (!template) return null;
+  return template.replace(/\{(\w+)\}/g, (_, key) => {
+    const value = values[key];
+    return value === undefined || value === null ? '' : String(value);
+  });
+}
+
+function buildContainerAccess({ dockerPort, outputPort, serverNumber }) {
+  const resolvedServerNumber = Number(serverNumber) > 0 ? Number(serverNumber) : 1;
+  const routingMode = isProductionContainerRouting() ? 'production' : 'development';
+
+  if (isProductionContainerRouting()) {
+    const serverBaseUrl = normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL);
+    const resolvedServerBaseUrl = serverBaseUrl ? `${serverBaseUrl}/${resolvedServerNumber}` : null;
+    const templateValues = {
+      dockerPort,
+      outputPort,
+      serverNumber: resolvedServerNumber,
+      serverBaseUrl: resolvedServerBaseUrl || ''
+    };
+
+    return {
+      routing_mode: routingMode,
+      container_server_number: resolvedServerNumber,
+      container_server_base_url: resolvedServerBaseUrl,
+      editor_url:
+        applyTemplate(process.env.CONTAINER_EDITOR_URL_TEMPLATE, templateValues) ||
+        (resolvedServerBaseUrl && dockerPort
+          ? `${resolvedServerBaseUrl}/${dockerPort}/?folder=${encodeURIComponent(CONTAINER_WORKSPACE_FOLDER)}`
+          : null),
+      preview_url:
+        applyTemplate(process.env.CONTAINER_PREVIEW_URL_TEMPLATE, templateValues) ||
+        (resolvedServerBaseUrl && outputPort ? `${resolvedServerBaseUrl}/out/${outputPort}` : null)
+    };
+  }
+
+  const editorBaseUrl = normalizeBaseUrl(process.env.CONTAINER_EDITOR_BASE_URL || 'http://localhost');
+  const previewBaseUrl = normalizeBaseUrl(process.env.CONTAINER_PREVIEW_BASE_URL || 'http://localhost');
+
+  return {
+    routing_mode: routingMode,
+    container_server_number: resolvedServerNumber,
+    container_server_base_url: null,
+    editor_url: dockerPort ? `${editorBaseUrl}:${dockerPort}/?folder=${encodeURIComponent(CONTAINER_WORKSPACE_FOLDER)}` : null,
+    preview_url: outputPort ? `${previewBaseUrl}:${outputPort}` : null
+  };
+}
+
+function getContainerProvisionDispatchUrl(serverNumber) {
+  const template = process.env.CONTAINER_SERVER_PROVISION_URL_TEMPLATE;
+  if (!template) return null;
+
+  return applyTemplate(template, {
+    serverNumber,
+    serverBaseUrl: normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL)
+      ? `${normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL)}/${serverNumber}`
+      : ''
+  });
+}
+
+function buildLocalProvisionCommand(container) {
+  const isWindows = process.platform === 'win32';
+  const ext = isWindows ? 'ps1' : 'sh';
+  const identifier = `pac${container.id}`;
+  const framework = 'react';
+  const scriptPath = path.join(__dirname, `generate-docker-compose-${container.question_id}-${framework}.${ext}`);
+  const command = isWindows
+    ? `powershell.exe -ExecutionPolicy Bypass -File "${scriptPath}" -UserID 0 -EmployeeNo "${identifier}" -dockerPort ${container.docker_port} -outputPort ${container.output_port}`
+    : `bash "${scriptPath}" "0" "${identifier}" "${container.docker_port}" "${container.output_port}"`;
+
+  return { command, identifier, scriptPath };
+}
+
+function dispatchProvisionedContainer(batchId, container) {
+  const { identifier, command } = buildLocalProvisionCommand(container);
+  const access = buildContainerAccess({
+    dockerPort: container.docker_port,
+    outputPort: container.output_port,
+    serverNumber: container.container_server_number
+  });
+
+  if (isProductionContainerRouting()) {
+    const dispatchUrl = getContainerProvisionDispatchUrl(container.container_server_number);
+    if (!dispatchUrl) {
+      console.error(
+        `[Batch:${batchId}] Missing CONTAINER_SERVER_PROVISION_URL_TEMPLATE for production routing of ${identifier} (server ${container.container_server_number})`
+      );
+      return;
+    }
+
+    axios.post(
+      dispatchUrl,
+      {
+        batch_id: Number(batchId),
+        container_id: container.id,
+        container_identifier: identifier,
+        question_id: container.question_id,
+        docker_port: container.docker_port,
+        output_port: container.output_port,
+        container_server_number: container.container_server_number,
+        editor_url: access.editor_url,
+        preview_url: access.preview_url,
+        framework: 'react'
+      },
+      {
+        timeout: Number.parseInt(process.env.CONTAINER_SERVER_DISPATCH_TIMEOUT_MS || '15000', 10)
+      }
+    )
+      .then(() => {
+        console.log(
+          `[Batch:${batchId}] Routed ${identifier} (${container.question_id}) to container server ${container.container_server_number}`
+        );
+      })
+      .catch((error) => {
+        console.error(
+          `[Batch:${batchId}] Failed to dispatch ${identifier} to container server ${container.container_server_number}: ${error.message}`
+        );
+      });
+    return;
+  }
+
+  console.log(
+    `[Batch:${batchId}] Starting Docker container ${identifier} (${container.question_id}) on ports ${container.docker_port}/${container.output_port}`
+  );
+  exec(command, (error) => {
+    if (error) {
+      console.error(`[Batch:${batchId}] Docker start failed for ${identifier}: ${error.message}`);
+      return;
+    }
+    console.log(`[Batch:${batchId}] Container ${identifier} started`);
+  });
+}
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'] || req.headers['Authorization'];
@@ -141,6 +299,7 @@ con.getConnection((error, connection) => {
       port_slot_id INT NOT NULL,
       docker_port INT NOT NULL,
       output_port INT NOT NULL,
+      container_server_number INT DEFAULT 1,
       is_assigned TINYINT(1) NOT NULL DEFAULT 0,
       aon_id VARCHAR(100) DEFAULT NULL,
       assigned_at DATETIME DEFAULT NULL,
@@ -151,12 +310,11 @@ con.getConnection((error, connection) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     // New columns for Docker container tracking
     "ALTER TABLE pre_allocated_containers ADD COLUMN container_identifier VARCHAR(50) NULL",
+    "ALTER TABLE pre_allocated_containers ADD COLUMN container_server_number INT DEFAULT 1",
     "ALTER TABLE pre_allocated_containers ADD COLUMN is_deprovisioned TINYINT(1) NOT NULL DEFAULT 0",
+    "ALTER TABLE launch_tokens ADD COLUMN container_server_number INT DEFAULT 1",
     // Extend batch status enum to include deprovisioned
-    "ALTER TABLE assessment_batches MODIFY COLUMN status ENUM('draft','active','completed','deprovisioned') NOT NULL DEFAULT 'draft'",
-    // Distributed provisioning: track which worker server hosts each container
-    "ALTER TABLE pre_allocated_containers ADD COLUMN server_index INT DEFAULT NULL",
-    "ALTER TABLE pre_allocated_containers ADD COLUMN server_url VARCHAR(255) DEFAULT NULL"
+    "ALTER TABLE assessment_batches MODIFY COLUMN status ENUM('draft','active','completed','deprovisioned') NOT NULL DEFAULT 'draft'"
   ];
   for (const sql of migrations) {
     try {
@@ -1383,7 +1541,7 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
 
           const [pacRows] = await connection.query(
             `SELECT pac.id, pac.batch_id, pac.test_id, pac.question_id,
-                    pac.port_slot_id, pac.docker_port, pac.output_port
+                    pac.port_slot_id, pac.docker_port, pac.output_port, pac.container_server_number
              FROM pre_allocated_containers pac
              WHERE pac.batch_id = ? AND pac.is_assigned = 0 AND pac.is_deprovisioned = 0
              ORDER BY pac.test_id DESC, pac.id ASC
@@ -1401,7 +1559,12 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
 
           const pac = pacRows[0];
           selectedQuestion = pac.question_id;
-          portSlot = { id: pac.port_slot_id, docker_port: pac.docker_port, output_port: pac.output_port };
+          portSlot = {
+            id: pac.port_slot_id,
+            docker_port: pac.docker_port,
+            output_port: pac.output_port,
+            container_server_number: pac.container_server_number || 1
+          };
           portSlotAlreadyUtilized = true; // port_slot was marked utilized at provision time
 
           // Validate stored test_id is still active; fall back to latest active test if not
@@ -1478,7 +1641,7 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
           `SELECT id, docker_port, output_port FROM port_slots WHERE is_utilized = 0 ORDER BY id ASC LIMIT 1 FOR UPDATE`
         );
         if (!portSlots.length) throw new Error('No free port slots available');
-        portSlot = portSlots[0];
+        portSlot = { ...portSlots[0], container_server_number: 1 };
       }
 
       const launchToken = generateOpaqueToken();
@@ -1486,9 +1649,9 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
       // 4️⃣ insert launch token with port_slot_id and question_id
       await connection.query(
         `INSERT INTO launch_tokens
-        (token, session_id, aon_id, test_id, port_slot_id, question_id, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 3 HOUR))`,
-        [launchToken, session_id, aon_id, test.id, portSlot.id, selectedQuestion]
+        (token, session_id, aon_id, test_id, port_slot_id, question_id, container_server_number, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 3 HOUR))`,
+        [launchToken, session_id, aon_id, test.id, portSlot.id, selectedQuestion, portSlot.container_server_number || 1]
       );
 
       // 5️⃣ mark port_slot as utilized (skipped for pre-allocated containers already marked at provision time)
@@ -1558,6 +1721,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
         lt.workspace_url,
         lt.framework,
         lt.submitted,
+        lt.container_server_number,
         t.test_name,
 
         lt.question_id,
@@ -1594,9 +1758,18 @@ app.get("/v2/aon/resolve", async (req, res) => {
     //   [t]
     // );
 
+    const payload = {
+      ...rows[0],
+      ...buildContainerAccess({
+        dockerPort: rows[0].docker_port,
+        outputPort: rows[0].output_port,
+        serverNumber: rows[0].container_server_number || 1
+      })
+    };
+
     return res.json({
       success: true,
-      payload: rows[0]
+      payload
     });
   });
 
@@ -2732,7 +2905,17 @@ app.get('/v2/assessment-batches/:id', async (req, res) => {
       [req.params.id]
     );
 
-    res.json({ ...batches[0], containers });
+    res.json({
+      ...batches[0],
+      containers: containers.map((container, index) => ({
+        ...container,
+        ...buildContainerAccess({
+          dockerPort: container.docker_port,
+          outputPort: container.output_port,
+          serverNumber: container.container_server_number || getContainerServerNumber(index + 1)
+        })
+      }))
+    });
   } catch (err) {
     console.error('Error fetching batch:', err);
     res.status(500).json({ error: 'Failed to fetch batch' });
@@ -2790,6 +2973,13 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
 
   let connection;
   try {
+    if (isProductionContainerRouting() && !process.env.CONTAINER_SERVER_PROVISION_URL_TEMPLATE) {
+      return res.status(500).json({
+        error: 'Missing production container routing configuration',
+        message: 'Set CONTAINER_SERVER_PROVISION_URL_TEMPLATE before provisioning in production mode.'
+      });
+    }
+
     const [batches] = await con.promise().query(
       'SELECT * FROM assessment_batches WHERE id = ?',
       [batchId]
@@ -2863,12 +3053,21 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
     // Build container rows — round-robin question assignment
     const containerRows = freeSlots.map((slot, idx) => {
       const q = questions[idx % questions.length];
-      return [batchId, selectedTest.id, q.question_id, slot.id, slot.docker_port, slot.output_port];
+      const containerServerNumber = getContainerServerNumber(idx + 1);
+      return [
+        batchId,
+        selectedTest.id,
+        q.question_id,
+        slot.id,
+        slot.docker_port,
+        slot.output_port,
+        containerServerNumber
+      ];
     });
 
     await connection.query(
       `INSERT INTO pre_allocated_containers
-       (batch_id, test_id, question_id, port_slot_id, docker_port, output_port)
+       (batch_id, test_id, question_id, port_slot_id, docker_port, output_port, container_server_number)
        VALUES ?`,
       [containerRows]
     );
@@ -2889,19 +3088,16 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
 
     // Fetch inserted containers and fire Docker creation scripts (async, non-blocking)
     const [provisionedContainers] = await con.promise().query(
-      `SELECT id, question_id, docker_port, output_port FROM pre_allocated_containers WHERE batch_id = ? AND is_deprovisioned = 0`,
+      `SELECT id, question_id, docker_port, output_port, container_server_number
+       FROM pre_allocated_containers
+       WHERE batch_id = ? AND is_deprovisioned = 0
+       ORDER BY id ASC`,
       [batchId]
     );
 
-    console.log(`[Batch:${batchId}] 🌐 Provisioning mode: ${IS_PROD ? `PRODUCTION (K=${K} containers/server)` : 'DEVELOPMENT (local exec)'}`);
-
-    provisionedContainers.forEach((c, containerIndex) => {
-      const identifier = `pac${c.id}`;
-      dispatchContainer(containerIndex, c, identifier, batchId, selectedTest.id, con.promise())
-        .catch(err => {
-          console.error(`[Batch:${batchId}] ❌ Provisioning failed for ${identifier}: ${err.message}`);
-        });
-    });
+    for (const c of provisionedContainers) {
+      dispatchProvisionedContainer(batchId, c);
+    }
 
     console.log(`[Batch:${batchId}] ✅ Provisioned ${n} containers for test "${selectedTest.test_name}"`);
     res.json({
@@ -2910,6 +3106,13 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
       test_id: selectedTest.id,
       test_name: selectedTest.test_name,
       containers_created: n,
+      routing_mode: isProductionContainerRouting() ? 'production' : 'development',
+      containers_per_server: getContainersPerServer(),
+      server_distribution: provisionedContainers.reduce((acc, container) => {
+        const key = String(container.container_server_number || 1);
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {}),
       questions_used: questions.map(q => q.question_id)
     });
 
