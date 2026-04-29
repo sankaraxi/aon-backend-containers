@@ -31,6 +31,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-change-in-prod';
 const BASIC_AUTH_USER = process.env.BASIC_AUTH_USER;
 const BASIC_AUTH_PASS = process.env.BASIC_AUTH_PASS;
 const CONTAINER_WORKSPACE_FOLDER = '/home/coder/project';
+const DEFAULT_CONTAINERS_PER_SERVER = 3;
 
 function normalizeBaseUrl(baseUrl) {
   return (baseUrl || '').trim().replace(/\/+$/, '');
@@ -41,19 +42,22 @@ function isProductionContainerRouting() {
   return mode === 'production';
 }
 
-function getContainersPerServer() {
-  const parsed = Number.parseInt(
-    process.env.CONTAINERS_PER_SERVER || process.env.CONTAINER_BUCKET_SIZE || '1',
-    10
-  );
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+function resolveContainersPerServer(containersPerServer) {
+  const resolved = Number.parseInt(containersPerServer, 10);
+  return Number.isFinite(resolved) && resolved > 0 ? resolved : DEFAULT_CONTAINERS_PER_SERVER;
 }
 
-function getContainerServerNumber(containerOrdinal) {
+function getRequiredContainerServerCount(totalUsers, containersPerServer) {
+  const resolvedTotalUsers = Number(totalUsers);
+  if (!Number.isFinite(resolvedTotalUsers) || resolvedTotalUsers < 1) return 1;
+  return Math.ceil(resolvedTotalUsers / resolveContainersPerServer(containersPerServer));
+}
+
+function getContainerServerNumber(containerOrdinal, containersPerServer) {
   const ordinal = Number(containerOrdinal);
   if (!isProductionContainerRouting()) return 1;
   if (!Number.isFinite(ordinal) || ordinal < 1) return 1;
-  return Math.floor((ordinal - 1) / getContainersPerServer()) + 1;
+  return Math.floor((ordinal - 1) / resolveContainersPerServer(containersPerServer)) + 1;
 }
 
 function applyTemplate(template, values) {
@@ -667,6 +671,7 @@ con.getConnection((error, connection) => {
       business_id INT DEFAULT NULL,
       client_id INT NOT NULL,
       estimated_users INT NOT NULL DEFAULT 0,
+      containers_per_server INT NOT NULL DEFAULT 3,
       status ENUM('draft','active','completed') NOT NULL DEFAULT 'draft',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -702,6 +707,7 @@ con.getConnection((error, connection) => {
     "ALTER TABLE pre_allocated_containers ADD COLUMN provision_error TEXT NULL",
     "ALTER TABLE pre_allocated_containers ADD COLUMN provisioned_at DATETIME NULL",
     "ALTER TABLE launch_tokens ADD COLUMN container_server_number INT DEFAULT 1",
+    "ALTER TABLE assessment_batches ADD COLUMN containers_per_server INT NOT NULL DEFAULT 3",
     // Extend batch status enum to include deprovisioned
     "ALTER TABLE assessment_batches MODIFY COLUMN status ENUM('draft','active','completed','deprovisioned') NOT NULL DEFAULT 'draft'"
   ];
@@ -3450,9 +3456,9 @@ app.get('/v2/assessment-batches/:id', async (req, res) => {
 
 // Create assessment batch
 app.post('/v2/assessment-batches', async (req, res) => {
-  const { batch_name, client_id, estimated_users } = req.body;
-  if (!batch_name || !client_id || !estimated_users) {
-    return res.status(400).json({ error: 'batch_name, client_id, and estimated_users are required' });
+  const { batch_name, client_id, estimated_users, containers_per_server } = req.body;
+  if (!batch_name || !client_id || !estimated_users || !containers_per_server) {
+    return res.status(400).json({ error: 'batch_name, client_id, estimated_users, and containers_per_server are required' });
   }
   try {
     const [clients] = await con.promise().query(
@@ -3462,8 +3468,8 @@ app.post('/v2/assessment-batches', async (req, res) => {
     if (!clients.length) return res.status(404).json({ error: 'Client not found' });
 
     const [result] = await con.promise().query(
-      'INSERT INTO assessment_batches (batch_name, client_id, business_id, estimated_users, status) VALUES (?, ?, ?, ?, ?)',
-      [batch_name, client_id, clients[0].business_id || null, Number(estimated_users), 'draft']
+      'INSERT INTO assessment_batches (batch_name, client_id, business_id, estimated_users, containers_per_server, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [batch_name, client_id, clients[0].business_id || null, Number(estimated_users), resolveContainersPerServer(containers_per_server), 'draft']
     );
     res.status(201).json({ message: 'Assessment batch created', batch_id: result.insertId });
   } catch (err) {
@@ -3474,15 +3480,22 @@ app.post('/v2/assessment-batches', async (req, res) => {
 
 // Update assessment batch status
 app.put('/v2/assessment-batches/:id', async (req, res) => {
-  const { status, batch_name, estimated_users } = req.body;
+  const { status, batch_name, estimated_users, containers_per_server } = req.body;
   try {
     const [result] = await con.promise().query(
       `UPDATE assessment_batches
        SET batch_name = COALESCE(?, batch_name),
            estimated_users = COALESCE(?, estimated_users),
+           containers_per_server = COALESCE(?, containers_per_server),
            status = COALESCE(?, status)
        WHERE id = ?`,
-      [batch_name || null, estimated_users != null ? Number(estimated_users) : null, status || null, req.params.id]
+      [
+        batch_name || null,
+        estimated_users != null ? Number(estimated_users) : null,
+        containers_per_server != null ? resolveContainersPerServer(containers_per_server) : null,
+        status || null,
+        req.params.id
+      ]
     );
     if (result.affectedRows === 0) return res.status(404).json({ error: 'Batch not found' });
     res.json({ message: 'Batch updated' });
@@ -3549,6 +3562,7 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
     const selectedTest = tests[0];
 
     const n = batch.estimated_users;
+    const containersPerServer = resolveContainersPerServer(batch.containers_per_server);
 
     connection = await con.promise().getConnection();
     await connection.beginTransaction();
@@ -3580,7 +3594,7 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
     const containerRows = freeSlots.map((slot, idx) => {
       const q = questions[idx % questions.length];
       
-      const containerServerNumber = getContainerServerNumber(idx + 1);
+      const containerServerNumber = getContainerServerNumber(idx + 1, containersPerServer);
       return [
         batchId,
         selectedTest.id,
@@ -3632,9 +3646,11 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
       batch_id: Number(batchId),
       test_id: selectedTest.id,
       test_name: selectedTest.test_name,
+      total_users: n,
       containers_created: n,
       routing_mode: isProductionContainerRouting() ? 'production' : 'development',
-      containers_per_server: getContainersPerServer(),
+      containers_per_server: containersPerServer,
+      total_servers_required: getRequiredContainerServerCount(n, containersPerServer),
       server_distribution: provisionedContainers.reduce((acc, container) => {
         const key = String(container.container_server_number || 1);
         acc[key] = (acc[key] || 0) + 1;
