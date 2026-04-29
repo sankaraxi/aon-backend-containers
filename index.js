@@ -71,6 +71,7 @@ function buildContainerAccess({ dockerPort, outputPort, serverNumber }) {
   if (isProductionContainerRouting()) {
     const serverBaseUrl = normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL);
     const resolvedServerBaseUrl = serverBaseUrl ? `${serverBaseUrl}/${resolvedServerNumber}` : null;
+    const serverOrigin = getUrlDetails(resolvedServerBaseUrl || serverBaseUrl || null).origin;
     const templateValues = {
       dockerPort,
       outputPort,
@@ -82,6 +83,9 @@ function buildContainerAccess({ dockerPort, outputPort, serverNumber }) {
       routing_mode: routingMode,
       container_server_number: resolvedServerNumber,
       container_server_base_url: resolvedServerBaseUrl,
+      api_base_url:
+        applyTemplate(process.env.CONTAINER_API_URL_TEMPLATE, templateValues) ||
+        (serverOrigin ? `${serverOrigin}/api/${resolvedServerNumber}` : null),
       editor_url:
         applyTemplate(process.env.CONTAINER_EDITOR_URL_TEMPLATE, templateValues) ||
         (resolvedServerBaseUrl && dockerPort
@@ -100,6 +104,7 @@ function buildContainerAccess({ dockerPort, outputPort, serverNumber }) {
     routing_mode: routingMode,
     container_server_number: resolvedServerNumber,
     container_server_base_url: null,
+    api_base_url: normalizeBaseUrl(process.env.CONTAINER_API_BASE_URL || process.env.BACKEND_PUBLIC_BASE_URL || process.env.ORIGIN) || null,
     editor_url: dockerPort ? `${editorBaseUrl}:${dockerPort}/?folder=${encodeURIComponent(CONTAINER_WORKSPACE_FOLDER)}` : null,
     preview_url: outputPort ? `${previewBaseUrl}:${outputPort}` : null
   };
@@ -165,6 +170,23 @@ function formatAxiosErrorDetails(error) {
     response_data: responseData,
     message: error.message
   };
+}
+
+async function updateProvisioningStatus(containerId, status, details = {}) {
+  if (!containerId) return;
+
+  const provisionError = details.errorMessage ? String(details.errorMessage).slice(0, 1000) : null;
+  const serverNumber = Number(details.serverNumber) > 0 ? Number(details.serverNumber) : null;
+
+  await con.promise().query(
+    `UPDATE pre_allocated_containers
+     SET provision_status = ?,
+         provision_error = ?,
+         provisioned_at = CASE WHEN ? = 'success' THEN NOW() ELSE provisioned_at END,
+         container_server_number = COALESCE(?, container_server_number)
+     WHERE id = ?`,
+    [status, provisionError, status, serverNumber, containerId]
+  );
 }
 
 function buildLocalProvisionCommand(container) {
@@ -256,7 +278,15 @@ function dispatchProvisionedContainer(batchId, container) {
         timeout: Number.parseInt(process.env.CONTAINER_SERVER_DISPATCH_TIMEOUT_MS || '15000', 10)
       }
     )
-      .then((response) => {
+      .then(async (response) => {
+        try {
+          await updateProvisioningStatus(container.id, 'success', {
+            serverNumber: container.container_server_number
+          });
+        } catch (dbError) {
+          console.error(`[Batch:${batchId}] Failed to persist success status for ${identifier}: ${dbError.message}`);
+        }
+
         console.log(
           `[Batch:${batchId}] Routed ${identifier} (${container.question_id}) to container server ${container.container_server_number} at ${dispatchUrlDetails.pathname || dispatchUrlDetails.href} with status ${response.status}`
         );
@@ -266,8 +296,17 @@ function dispatchProvisionedContainer(batchId, container) {
           );
         }
       })
-      .catch((error) => {
+      .catch(async (error) => {
         const details = formatAxiosErrorDetails(error);
+        try {
+          await updateProvisioningStatus(container.id, 'failed', {
+            serverNumber: container.container_server_number,
+            errorMessage: details.message || JSON.stringify(details.response_data || {})
+          });
+        } catch (dbError) {
+          console.error(`[Batch:${batchId}] Failed to persist failure status for ${identifier}: ${dbError.message}`);
+        }
+
         console.error(
           `[Batch:${batchId}] Failed to dispatch ${identifier} to container server ${container.container_server_number}: ${details.message}`
         );
@@ -298,10 +337,27 @@ function dispatchProvisionedContainer(batchId, container) {
     `[Batch:${batchId}] Starting Docker container ${identifier} (${container.question_id}) on ports ${container.docker_port}/${container.output_port}`
   );
   runContainerProvisionLocally(container)
-    .then(() => {
+    .then(async () => {
+      try {
+        await updateProvisioningStatus(container.id, 'success', {
+          serverNumber: container.container_server_number
+        });
+      } catch (dbError) {
+        console.error(`[Batch:${batchId}] Failed to persist local success status for ${identifier}: ${dbError.message}`);
+      }
+
       console.log(`[Batch:${batchId}] Container ${identifier} started`);
     })
-    .catch((result) => {
+    .catch(async (result) => {
+      try {
+        await updateProvisioningStatus(container.id, 'failed', {
+          serverNumber: container.container_server_number,
+          errorMessage: result.error?.message || result.stderr || 'Local provisioning failed'
+        });
+      } catch (dbError) {
+        console.error(`[Batch:${batchId}] Failed to persist local failure status for ${identifier}: ${dbError.message}`);
+      }
+
       console.error(`[Batch:${batchId}] Docker start failed for ${identifier}: ${result.error.message}`);
       if (result.stderr) {
         console.error(`[Batch:${batchId}] Docker start stderr for ${identifier}: ${result.stderr}`);
@@ -509,6 +565,9 @@ con.getConnection((error, connection) => {
       is_assigned TINYINT(1) NOT NULL DEFAULT 0,
       aon_id VARCHAR(100) DEFAULT NULL,
       assigned_at DATETIME DEFAULT NULL,
+      provision_status ENUM('pending','success','failed') NOT NULL DEFAULT 'pending',
+      provision_error TEXT DEFAULT NULL,
+      provisioned_at DATETIME DEFAULT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       KEY fk_pac_batch (batch_id),
@@ -518,6 +577,9 @@ con.getConnection((error, connection) => {
     "ALTER TABLE pre_allocated_containers ADD COLUMN container_identifier VARCHAR(50) NULL",
     "ALTER TABLE pre_allocated_containers ADD COLUMN container_server_number INT DEFAULT 1",
     "ALTER TABLE pre_allocated_containers ADD COLUMN is_deprovisioned TINYINT(1) NOT NULL DEFAULT 0",
+    "ALTER TABLE pre_allocated_containers ADD COLUMN provision_status ENUM('pending','success','failed') NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE pre_allocated_containers ADD COLUMN provision_error TEXT NULL",
+    "ALTER TABLE pre_allocated_containers ADD COLUMN provisioned_at DATETIME NULL",
     "ALTER TABLE launch_tokens ADD COLUMN container_server_number INT DEFAULT 1",
     // Extend batch status enum to include deprovisioned
     "ALTER TABLE assessment_batches MODIFY COLUMN status ENUM('draft','active','completed','deprovisioned') NOT NULL DEFAULT 'draft'"
@@ -2971,6 +3033,7 @@ app.get('/v2/superadmin/dashboard', async (req, res) => {
   let portSlotStats = { total_slots: 0, utilized_slots: 0, free_slots: 0 };
   let questionStats = [];
   let recentAssignments = [];
+  let successfulContainers = [];
 
   try {
     const [rows] = await con.promise().query(
@@ -3029,11 +3092,30 @@ app.get('/v2/superadmin/dashboard', async (req, res) => {
     console.warn('test_assignment_users table not available:', e.message);
   }
 
+  try {
+    const [rows] = await con.promise().query(
+      `SELECT pac.id, pac.batch_id, pac.question_id, pac.container_identifier,
+              pac.container_server_number, pac.provisioned_at,
+              ab.batch_name, c.client_name
+       FROM pre_allocated_containers pac
+       LEFT JOIN assessment_batches ab ON ab.id = pac.batch_id
+       LEFT JOIN clients c ON c.client_id = ab.client_id
+       WHERE pac.is_deprovisioned = 0
+         AND COALESCE(pac.provision_status, 'success') = 'success'
+       ORDER BY COALESCE(pac.provisioned_at, pac.created_at) DESC
+       LIMIT 30`
+    );
+    successfulContainers = rows;
+  } catch (e) {
+    console.warn('successful containers query failed:', e.message);
+  }
+
   res.json({
     businesses,
     port_slots: portSlotStats,
     questions: questionStats,
-    recent_assignments: recentAssignments
+    recent_assignments: recentAssignments,
+    successful_containers: successfulContainers
   });
 });
 
@@ -3110,6 +3192,7 @@ app.get('/v2/assessment-batches/:id', async (req, res) => {
        FROM pre_allocated_containers pac
        LEFT JOIN port_slots ps ON ps.id = pac.port_slot_id
        WHERE pac.batch_id = ?
+         AND COALESCE(pac.provision_status, 'success') = 'success'
        ORDER BY pac.id ASC`,
       [req.params.id]
     );

@@ -1,0 +1,39 @@
+﻿version: '3.8'
+
+services:
+  code-server:
+    container_name: "code-server-a1l1q1-react-pac68"
+    image: "sankarkg/level-one-test:latest"
+    ports:
+      - "10004:8080"
+      - "10005:5173"
+    volumes:
+      - frontend-src-pac68:/home/coder/project/src
+    environment:
+      - WATCHPACK_POLLING=true
+    command:
+        code-server --bind-addr 0.0.0.0:8080 --auth none /home/coder/project
+    networks:
+      - my_network
+
+  # nginx:
+  #   image: nginx
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf
+  #   ports:
+  #     - "3005:80"
+  #   depends_on:
+  #     - code-server
+      
+      
+networks:
+  my_network:
+    external: true
+
+volumes:
+  frontend-src-pac68:
+    driver: local
+ 
+# networks:
+#   my_network:
+#     driver: bridge
