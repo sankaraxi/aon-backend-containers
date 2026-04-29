@@ -2,7 +2,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-async function a1l1q2(id, framework,outputPort) {
+async function a1l1q2(id, framework,outputPort, serverNumber = 1) {
   console.log(id, framework);
 
   console.log('Starting A1L1RQ02 assessment...');
@@ -13,8 +13,9 @@ async function a1l1q2(id, framework,outputPort) {
   let baseURL = '';
 
   if (outputPort) {
-    // baseURL = `http://localhost:${outputPort}`;
-    baseURL = `http://localhost:${outputPort}/out/${outputPort}`;
+    baseURL = serverNumber > 1 || process.env.CONTAINER_ROUTING_MODE === 'production'
+      ? `https://aws-test.starsquare.in/container-server/${serverNumber}/out/${outputPort}/`
+      : `http://localhost:${outputPort}`;
     console.log('Using provided outputPort:', outputPort);
   }
 

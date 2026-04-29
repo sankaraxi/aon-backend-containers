@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const con = require('.');
 
-async function a1l1q1(id,framework,outputPort) { 
+async function a1l1q1(id,framework,outputPort, serverNumber = 1) { 
 
   // console.log("vanakam da mapla naan dhan output port test la irundhu", outputPort);
   // console.log("inside test"); 
@@ -26,9 +26,9 @@ async function a1l1q1(id,framework,outputPort) {
   // } 
 
   if (outputPort) {
-    // baseURL = `http://localhost:${outputPort}`;
-    baseURL = `http://localhost:${outputPort}/out/${outputPort}`;
-
+    baseURL = serverNumber > 1 || process.env.CONTAINER_ROUTING_MODE === 'production'
+      ? `http://aws-test.starsquare.in/container-server/${serverNumber}/out/${outputPort}/`
+      : `http://localhost:${outputPort}`;
   }
 
   console.log("This is the baseURL:", baseURL);

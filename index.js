@@ -635,15 +635,17 @@ async function runDockerCleanupForUser({ userId, question, framework }) {
   await insertUserLogSafe(userId, 7); // Docker Container Killed
 }
 
-async function submitFinalAssessmentInternal({ aonId, framework, outputPort, userQuestion, message }) {
+async function submitFinalAssessmentInternal({ aonId, framework, outputPort, userQuestion, message, serverNumber }) {
   if (!aonId || !framework || !userQuestion) {
     throw new Error("Missing required fields: aonId, framework, userQuestion");
   }
 
   const [latestTokenRows] = await con.promise().query(
-    "SELECT submitted FROM launch_tokens WHERE aon_id = ? ORDER BY id DESC LIMIT 1",
+    "SELECT submitted, container_server_number FROM launch_tokens WHERE aon_id = ? ORDER BY id DESC LIMIT 1",
     [aonId]
   );
+
+  const resolvedServerNumber = Number(serverNumber) || Number(latestTokenRows[0]?.container_server_number) || 1;
 
   if (latestTokenRows.length > 0 && Number(latestTokenRows[0].submitted) === 1) {
     return {
@@ -657,13 +659,13 @@ async function submitFinalAssessmentInternal({ aonId, framework, outputPort, use
 
   if (userQuestion === "a1l1q3") {
     const { a1l1q3 } = require("./A1L1RQ03.js");
-    results = await a1l1q3(aonId, framework, outputPort);
+    results = await a1l1q3(aonId, framework, outputPort, resolvedServerNumber);
   } else if (userQuestion === "a1l1q2") {
     const { a1l1q2 } = require("./A1L1RQ02.js");
-    results = await a1l1q2(aonId, framework, outputPort);
+    results = await a1l1q2(aonId, framework, outputPort, resolvedServerNumber);
   } else if (userQuestion === "a1l1q1") {
     const { a1l1q1 } = require("./A1L1RQ01.js");
-    results = await a1l1q1(aonId, framework, outputPort);
+    results = await a1l1q1(aonId, framework, outputPort, resolvedServerNumber);
   } else {
     throw new Error("Invalid question type");
   }
@@ -2085,7 +2087,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
   // Submit final assessment and send webhook
   app.post('/v2/submit-final', async (req, res) => {
     console.log('🚀 Received final submission');
-    const { aonId, framework, outputPort, userQuestion, autoSubmit, reason } = req.body;
+    const { aonId, framework, outputPort, userQuestion, autoSubmit, reason, serverNumber } = req.body;
 
     if (!aonId || !framework || !userQuestion) {
       return res.status(400).json({ error: 'Missing required fields: aonId, framework, userQuestion' });
@@ -2110,6 +2112,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
         framework,
         outputPort,
         userQuestion,
+        serverNumber,
         message: autoSubmitMessage,
       });
 

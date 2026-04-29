@@ -2,7 +2,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-async function a1l1q3(id, framework, outputPort) {
+async function a1l1q3(id, framework, outputPort, serverNumber = 1) {
   console.log(id, framework);
 
   // Define base URL based on framework
@@ -10,8 +10,9 @@ async function a1l1q3(id, framework, outputPort) {
   let baseURL = '';
 
    if (outputPort) {
-    // baseURL = `http://localhost:${outputPort}`;
-    baseURL = `http://localhost:${outputPort}/out/${outputPort}`;
+    baseURL = serverNumber > 1 || process.env.CONTAINER_ROUTING_MODE === 'production'
+      ? `https://aws-test.starsquare.in/container-server/${serverNumber}/out/${outputPort}/`
+      : `http://localhost:${outputPort}`;
   }
 
   // if (id === '8' && framework === 'react') {
