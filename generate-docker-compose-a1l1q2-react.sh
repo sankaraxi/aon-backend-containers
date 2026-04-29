@@ -5,6 +5,7 @@ USER_ID=$1
 EMPLOYEE_NO=$(echo "$2" | tr '[:upper:]' '[:lower:]')
 DOCKER_PORT=$3
 OUTPUT_PORT=$4
+SERVER=$5
 
 if [ -z "$EMPLOYEE_NO" ]; then
   echo "Usage: ./generate-docker-compose-a1l1.sh <EMPLOYEE_NO>"
@@ -75,7 +76,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 
 export default defineConfig({
-  base: '/out/${OUTPUT_PORT}',
+  base: '/container-server/${SERVER}/out/${OUTPUT_PORT}',
   plugins: [react()],
   server: {
     host: true,
@@ -92,4 +93,4 @@ echo "✅ vite.config.js injected for port ${OUTPUT_PORT}"
 # Restart Vite to pick up new config
 docker exec $CONTAINER_NAME bash -c "pkill -f vite; cd /home/coder/project && npm run dev > /dev/null 2>&1 &"
 
-echo "✅ Vite restarted with base /out/${OUTPUT_PORT}/"
+echo "✅ Vite restarted with base /container-server/${SERVER}/out/${OUTPUT_PORT}/"

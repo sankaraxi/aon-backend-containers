@@ -174,8 +174,8 @@ function buildLocalProvisionCommand(container) {
   const framework = 'react';
   const scriptPath = path.join(__dirname, `generate-docker-compose-${container.question_id}-${framework}.${ext}`);
   const command = isWindows
-    ? `powershell.exe -ExecutionPolicy Bypass -File "${scriptPath}" -UserID 0 -EmployeeNo "${identifier}" -dockerPort ${container.docker_port} -outputPort ${container.output_port}`
-    : `bash "${scriptPath}" "0" "${identifier}" "${container.docker_port}" "${container.output_port}"`;
+    ? `powershell.exe -ExecutionPolicy Bypass -File "${scriptPath}" -UserID 0 -EmployeeNo "${identifier}" -dockerPort ${container.docker_port} -outputPort ${container.output_port} `
+    : `bash "${scriptPath}" "0" "${identifier}" "${container.docker_port}" "${container.output_port}" "${container.container_server_number}"`;
 
   return { command, identifier, scriptPath };
 }
