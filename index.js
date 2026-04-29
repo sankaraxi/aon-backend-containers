@@ -117,6 +117,56 @@ function getContainerProvisionDispatchUrl(serverNumber) {
   });
 }
 
+function getUrlDetails(urlString) {
+  if (!urlString) {
+    return {
+      href: null,
+      origin: null,
+      pathname: null,
+      search: null
+    };
+  }
+
+  try {
+    const parsed = new URL(urlString);
+    return {
+      href: parsed.href,
+      origin: parsed.origin,
+      pathname: parsed.pathname,
+      search: parsed.search || ''
+    };
+  } catch {
+    return {
+      href: urlString,
+      origin: null,
+      pathname: null,
+      search: null
+    };
+  }
+}
+
+function formatAxiosErrorDetails(error) {
+  const method = error.config?.method ? String(error.config.method).toUpperCase() : 'UNKNOWN';
+  const urlDetails = getUrlDetails(error.config?.url || error.response?.config?.url || null);
+  const status = error.response?.status || null;
+  const statusText = error.response?.statusText || null;
+  const allowHeader = error.response?.headers?.allow || error.response?.headers?.Allow || null;
+  const responseData = error.response?.data;
+
+  return {
+    method,
+    dispatch_url: urlDetails.href,
+    dispatch_origin: urlDetails.origin,
+    dispatch_path: urlDetails.pathname,
+    dispatch_query: urlDetails.search,
+    status,
+    status_text: statusText,
+    allow: allowHeader,
+    response_data: responseData,
+    message: error.message
+  };
+}
+
 function buildLocalProvisionCommand(container) {
   const isWindows = process.platform === 'win32';
   const ext = isWindows ? 'ps1' : 'sh';
@@ -140,6 +190,7 @@ function dispatchProvisionedContainer(batchId, container) {
 
   if (isProductionContainerRouting()) {
     const dispatchUrl = getContainerProvisionDispatchUrl(container.container_server_number);
+    const dispatchUrlDetails = getUrlDetails(dispatchUrl);
     if (!dispatchUrl) {
       console.error(
         `[Batch:${batchId}] Missing CONTAINER_SERVER_PROVISION_URL_TEMPLATE for production routing of ${identifier} (server ${container.container_server_number})`
@@ -147,33 +198,70 @@ function dispatchProvisionedContainer(batchId, container) {
       return;
     }
 
+    const dispatchPayload = {
+      batch_id: Number(batchId),
+      container_id: container.id,
+      container_identifier: identifier,
+      question_id: container.question_id,
+      docker_port: container.docker_port,
+      output_port: container.output_port,
+      container_server_number: container.container_server_number,
+      editor_url: access.editor_url,
+      preview_url: access.preview_url,
+      framework: 'react'
+    };
+
+    console.log(
+      `[Batch:${batchId}] Dispatching ${identifier} to container server ${container.container_server_number} via ${dispatchUrlDetails.href}`
+    );
+    console.log(
+      `[Batch:${batchId}] Dispatch target path for ${identifier}: ${dispatchUrlDetails.pathname || 'N/A'}`
+    );
+    console.log(
+      `[Batch:${batchId}] Target deployment endpoints for ${identifier}: editor=${access.editor_url || 'N/A'} preview=${access.preview_url || 'N/A'}`
+    );
+
     axios.post(
       dispatchUrl,
-      {
-        batch_id: Number(batchId),
-        container_id: container.id,
-        container_identifier: identifier,
-        question_id: container.question_id,
-        docker_port: container.docker_port,
-        output_port: container.output_port,
-        container_server_number: container.container_server_number,
-        editor_url: access.editor_url,
-        preview_url: access.preview_url,
-        framework: 'react'
-      },
+      dispatchPayload,
       {
         timeout: Number.parseInt(process.env.CONTAINER_SERVER_DISPATCH_TIMEOUT_MS || '15000', 10)
       }
     )
-      .then(() => {
+      .then((response) => {
         console.log(
-          `[Batch:${batchId}] Routed ${identifier} (${container.question_id}) to container server ${container.container_server_number}`
+          `[Batch:${batchId}] Routed ${identifier} (${container.question_id}) to container server ${container.container_server_number} at ${dispatchUrlDetails.pathname || dispatchUrlDetails.href} with status ${response.status}`
         );
+        if (response.data !== undefined) {
+          console.log(
+            `[Batch:${batchId}] Dispatch response for ${identifier}: ${JSON.stringify(response.data)}`
+          );
+        }
       })
       .catch((error) => {
+        const details = formatAxiosErrorDetails(error);
         console.error(
-          `[Batch:${batchId}] Failed to dispatch ${identifier} to container server ${container.container_server_number}: ${error.message}`
+          `[Batch:${batchId}] Failed to dispatch ${identifier} to container server ${container.container_server_number}: ${details.message}`
         );
+        console.error(
+          `[Batch:${batchId}] Dispatch failure target for ${identifier}: method=${details.method} url=${details.dispatch_url || 'N/A'} path=${details.dispatch_path || 'N/A'}`
+        );
+        if (details.status) {
+          console.error(
+            `[Batch:${batchId}] Dispatch failure response for ${identifier}: status=${details.status} statusText=${details.status_text || 'N/A'} allow=${details.allow || 'N/A'}`
+          );
+        }
+        if (details.response_data !== undefined) {
+          console.error(
+            `[Batch:${batchId}] Dispatch failure body for ${identifier}: ${JSON.stringify(details.response_data)}`
+          );
+        }
+
+        if (details.status === 405) {
+          console.error(
+            `[Batch:${batchId}] ${identifier} hit a 405 Method Not Allowed. The target server/path exists, but it is rejecting POST on ${details.dispatch_path || details.dispatch_url || 'the resolved path'}.`
+          );
+        }
       });
     return;
   }
@@ -3053,6 +3141,7 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
     // Build container rows — round-robin question assignment
     const containerRows = freeSlots.map((slot, idx) => {
       const q = questions[idx % questions.length];
+      
       const containerServerNumber = getContainerServerNumber(idx + 1);
       return [
         batchId,
