@@ -122,6 +122,21 @@ function getContainerProvisionDispatchUrl(serverNumber) {
   });
 }
 
+function getContainerCleanupDispatchUrl(serverNumber) {
+  const template = process.env.CONTAINER_SERVER_CLEANUP_URL_TEMPLATE;
+  if (template) {
+    return applyTemplate(template, {
+      serverNumber,
+      serverBaseUrl: normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL)
+        ? `${normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL)}/${serverNumber}`
+        : ''
+    });
+  }
+
+  const baseUrl = normalizeBaseUrl(process.env.CONTAINER_SERVER_BASE_URL);
+  return baseUrl ? `${baseUrl}/${serverNumber}/cleanup` : null;
+}
+
 function getUrlDetails(urlString) {
   if (!urlString) {
     return {
@@ -223,6 +238,53 @@ function runContainerProvisionLocally(container) {
         identifier,
         scriptPath,
         command,
+        stdout,
+        stderr
+      });
+    });
+  });
+}
+
+function buildLocalCleanupCommand({ question, framework, containerIdentifier }) {
+  const isWindows = process.platform === 'win32';
+  const ext = isWindows ? 'ps1' : 'sh';
+  const scriptPath = path.join(__dirname, `cleanup-docker.${ext}`);
+  const command = isWindows
+    ? `powershell.exe -ExecutionPolicy Bypass -File "${scriptPath}" "${question}" "${framework}" "${containerIdentifier}"`
+    : `bash "${scriptPath}" "${question}" "${framework}" "${containerIdentifier}"`;
+
+  return { command, scriptPath, containerIdentifier };
+}
+
+function runContainerCleanupLocally({ question, framework, containerIdentifier }) {
+  const { command, scriptPath } = buildLocalCleanupCommand({
+    question,
+    framework,
+    containerIdentifier
+  });
+
+  return new Promise((resolve, reject) => {
+    exec(command, (error, stdout, stderr) => {
+      if (stderr) {
+        console.warn(`[${containerIdentifier}] ⚠️  Docker cleanup stderr: ${stderr.trim()}`);
+      }
+
+      if (error) {
+        reject({
+          command,
+          scriptPath,
+          containerIdentifier,
+          error,
+          stdout,
+          stderr
+        });
+        return;
+      }
+
+      resolve({
+        command,
+        scriptPath,
+        containerIdentifier,
         stdout,
         stderr
       });
@@ -452,6 +514,65 @@ app.post('/container-server/:serverNumber/provision', async (req, res) => {
   }
 });
 
+app.post('/container-server/:serverNumber/cleanup', async (req, res) => {
+  const serverNumber = Number(req.params.serverNumber) || 1;
+  const {
+    container_identifier,
+    question_id,
+    question,
+    framework,
+    userId
+  } = req.body || {};
+
+  const resolvedIdentifier = String(container_identifier || userId || '').trim();
+  const resolvedQuestion = question_id || question;
+  const resolvedFramework = framework || 'react';
+
+  if (!resolvedIdentifier || !resolvedQuestion) {
+    return res.status(400).json({
+      error: 'container_identifier and question_id are required'
+    });
+  }
+
+  console.log(
+    `[Worker:${serverNumber}] Cleanup request received for ${resolvedIdentifier} question=${resolvedQuestion} framework=${resolvedFramework}`
+  );
+
+  try {
+    const result = await runContainerCleanupLocally({
+      question: resolvedQuestion,
+      framework: resolvedFramework,
+      containerIdentifier: resolvedIdentifier
+    });
+
+    return res.json({
+      cleaned: true,
+      server_number: serverNumber,
+      cleanup_path: `/container-server/${serverNumber}/cleanup`,
+      container_identifier: resolvedIdentifier,
+      script_path: result.scriptPath,
+      stdout: result.stdout,
+      stderr: result.stderr || null
+    });
+  } catch (result) {
+    console.error(
+      `[Worker:${serverNumber}] Local cleanup failed for ${resolvedIdentifier}: ${result.error.message}`
+    );
+
+    return res.status(500).json({
+      cleaned: false,
+      server_number: serverNumber,
+      cleanup_path: `/container-server/${serverNumber}/cleanup`,
+      container_identifier: resolvedIdentifier,
+      script_path: result.scriptPath,
+      command: result.command,
+      error: result.error.message,
+      stdout: result.stdout || null,
+      stderr: result.stderr || null
+    });
+  }
+});
+
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'] || req.headers['Authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -663,38 +784,115 @@ async function insertErrorLogSafe(aonId, stage, message, detail = null) {
   }
 }
 
-async function runDockerCleanupForUser({ userId, question, framework }) {
-  if (!userId || !question || !framework) {
-    throw new Error("Missing userId, question, or framework for Docker cleanup");
+async function syncAssessmentBatchStatus(batchId, db = con.promise()) {
+  if (!batchId) return;
+
+  const [rows] = await db.query(
+    `SELECT COUNT(*) AS total_containers,
+            SUM(CASE WHEN is_deprovisioned = 0 THEN 1 ELSE 0 END) AS active_containers
+     FROM pre_allocated_containers
+     WHERE batch_id = ?`,
+    [batchId]
+  );
+
+  const totalContainers = Number(rows[0]?.total_containers || 0);
+  const activeContainers = Number(rows[0]?.active_containers || 0);
+
+  let nextStatus = 'draft';
+  if (totalContainers > 0) {
+    nextStatus = activeContainers > 0 ? 'active' : 'deprovisioned';
   }
 
-  const shScriptPath = path.join(__dirname, "cleanup-docker.sh");
-  const psScriptPath = path.join(__dirname, "cleanup-docker.ps1");
+  await db.query(
+    `UPDATE assessment_batches SET status = ? WHERE id = ?`,
+    [nextStatus, batchId]
+  );
+}
 
-  const command = process.platform === "win32"
-    ? `powershell.exe -ExecutionPolicy Bypass -File "${psScriptPath}" "${question}" "${framework}" "${userId}"`
-    : `bash "${shScriptPath}" "${question}" "${framework}" "${userId}"`;
+async function runDockerCleanupForUser({ userId, containerIdentifier, question, framework, serverNumber, logUserId }) {
+  const resolvedContainerIdentifier = String(containerIdentifier || userId || '').trim();
+  const resolvedServerNumber = Number(serverNumber) > 0 ? Number(serverNumber) : 1;
 
-  console.log(`[${userId}] 🗑️  Docker container kill initiated — question=${question}, framework=${framework}`);
-  console.log(`[${userId}] 🔧 Executing cleanup command: ${command}`);
+  if (!resolvedContainerIdentifier || !question || !framework) {
+    throw new Error("Missing containerIdentifier, question, or framework for Docker cleanup");
+  }
 
-  await new Promise((resolve, reject) => {
-    exec(command, (error, stdout, stderr) => {
-      if (stderr) {
-        console.warn(`[${userId}] ⚠️  Docker cleanup stderr: ${stderr.trim()}`);
+  console.log(
+    `[${resolvedContainerIdentifier}] 🗑️  Docker container kill initiated — question=${question}, framework=${framework}, server=${resolvedServerNumber}`
+  );
+
+  if (isProductionContainerRouting()) {
+    const dispatchUrl = getContainerCleanupDispatchUrl(resolvedServerNumber);
+    if (!dispatchUrl) {
+      throw new Error(`Missing cleanup dispatch URL for container server ${resolvedServerNumber}`);
+    }
+
+    const response = await axios.post(
+      dispatchUrl,
+      {
+        container_identifier: resolvedContainerIdentifier,
+        question_id: question,
+        framework
+      },
+      {
+        timeout: Number.parseInt(process.env.CONTAINER_SERVER_DISPATCH_TIMEOUT_MS || '15000', 10)
       }
-      if (error) {
-        console.error(`[${userId}] ❌ Docker cleanup exec error: ${error.message}`);
-        insertErrorLogSafe(userId, 'docker_cleanup', error.message, stderr || null);
-        return reject(error);
-      }
-      console.log(`[${userId}] ✅ Docker cleanup output:\n${stdout.trim()}`);
-      resolve();
+    );
+
+    console.log(
+      `[${resolvedContainerIdentifier}] ✅ Remote Docker cleanup acknowledged by server ${resolvedServerNumber} with status ${response.status}`
+    );
+  } else {
+    const result = await runContainerCleanupLocally({
+      question,
+      framework,
+      containerIdentifier: resolvedContainerIdentifier
     });
+    console.log(`[${resolvedContainerIdentifier}] ✅ Docker cleanup output:\n${(result.stdout || '').trim()}`);
+  }
+
+  const activityUserId = logUserId || userId;
+  if (activityUserId) {
+    console.log(`[${activityUserId}] 🧹 Docker container killed — logging activity code 7`);
+    await insertUserLogSafe(activityUserId, 7);
+  }
+}
+
+async function finalizeAssignedPreAllocatedContainer({ aonId, framework, fallbackQuestion, serverNumber }) {
+  if (!aonId) return null;
+
+  const [rows] = await con.promise().query(
+    `SELECT id, batch_id, question_id, container_identifier, container_server_number
+     FROM pre_allocated_containers
+     WHERE aon_id = ? AND is_assigned = 1 AND is_deprovisioned = 0
+     ORDER BY assigned_at DESC, id DESC
+     LIMIT 1`,
+    [aonId]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  const container = rows[0];
+
+  await con.promise().query(
+    `UPDATE pre_allocated_containers SET is_deprovisioned = 1 WHERE id = ?`,
+    [container.id]
+  );
+
+  await syncAssessmentBatchStatus(container.batch_id);
+
+  await runDockerCleanupForUser({
+    userId: aonId,
+    logUserId: aonId,
+    containerIdentifier: container.container_identifier || `pac${container.id}`,
+    question: container.question_id || fallbackQuestion,
+    framework: framework || 'react',
+    serverNumber: container.container_server_number || serverNumber
   });
 
-  console.log(`[${userId}] 🧹 Docker container killed — logging activity code 7`);
-  await insertUserLogSafe(userId, 7); // Docker Container Killed
+  return container;
 }
 
 async function submitFinalAssessmentInternal({ aonId, framework, outputPort, userQuestion, message, serverNumber }) {
@@ -766,6 +964,24 @@ async function submitFinalAssessmentInternal({ aonId, framework, outputPort, use
 
   await insertUserLogSafe(aonId, 6); // Submitted the Assessment
   console.log(`[${aonId}] 📝 Submission logged (activity code 6)`);
+
+  try {
+    const cleanedContainer = await finalizeAssignedPreAllocatedContainer({
+      aonId,
+      framework,
+      fallbackQuestion: userQuestion,
+      serverNumber: resolvedServerNumber
+    });
+
+    if (cleanedContainer) {
+      console.log(
+        `[${aonId}] ✅ Assigned pre-allocated container ${cleanedContainer.container_identifier || `pac${cleanedContainer.id}`} deprovisioned after submission`
+      );
+    }
+  } catch (e) {
+    console.error(`[${aonId}] ❌ Failed to deprovision assigned container after submission: ${e.message}`);
+    insertErrorLogSafe(aonId, 'assigned_container_cleanup', e.message);
+  }
 
   let redirectUrl = null;
   try {
@@ -2411,6 +2627,21 @@ app.get("/v2/aon/resolve", async (req, res) => {
         console.error("Failed to release port_slot for aonId", aonId, e.message);
       }
 
+      try {
+        const cleanedContainer = await finalizeAssignedPreAllocatedContainer({
+          aonId,
+          framework: 'react'
+        });
+        if (cleanedContainer) {
+          console.log(
+            `[${aonId}] ✅ Assigned pre-allocated container ${cleanedContainer.container_identifier || `pac${cleanedContainer.id}`} deprovisioned after no-assessment submission`
+          );
+        }
+      } catch (e) {
+        console.error(`[${aonId}] ❌ Failed to deprovision assigned container after no-assessment submission: ${e.message}`);
+        insertErrorLogSafe(aonId, 'assigned_container_cleanup', e.message);
+      }
+
       // Get redirect URL
       let redirectUrl = null;
       try {
@@ -3161,7 +3392,7 @@ app.get('/v2/assessment-batches', async (req, res) => {
         b.business_name,
         COUNT(pac.id) AS total_containers,
         SUM(pac.is_assigned = 0 AND pac.is_deprovisioned = 0) AS available_containers,
-        SUM(pac.is_assigned = 1) AS assigned_containers,
+        SUM(pac.is_assigned = 1 AND pac.is_deprovisioned = 0) AS assigned_containers,
         SUM(pac.is_deprovisioned = 1) AS deprovisioned_containers
        FROM assessment_batches ab
        LEFT JOIN clients c ON c.client_id = ab.client_id
@@ -3421,22 +3652,24 @@ app.post('/v2/assessment-batches/:id/provision', async (req, res) => {
   }
 });
 
-// Deprovision containers for a batch — marks ALL containers as deprovisioned, releases port slots, stops Docker containers
-// Data is kept in DB (soft delete) and visible in the UI as "deprovisioned". Marks batch as completed.
+// Deprovision containers for a batch — marks ALL containers as deprovisioned, releases port slots, stops Docker containers.
+// Data is kept in DB (soft delete) and visible in the UI as "deprovisioned".
 app.delete('/v2/assessment-batches/:id/containers', async (req, res) => {
   const batchId = req.params.id;
   let connection;
+  let containers = [];
   try {
     connection = await con.promise().getConnection();
     await connection.beginTransaction();
 
     // Get ALL non-deprovisioned containers for this batch (including assigned ones)
-    const [containers] = await connection.query(
-      `SELECT id, port_slot_id, container_identifier, question_id
+    const [containerRows] = await connection.query(
+      `SELECT id, batch_id, port_slot_id, container_identifier, question_id, container_server_number, aon_id
        FROM pre_allocated_containers
        WHERE batch_id = ? AND is_deprovisioned = 0`,
       [batchId]
     );
+    containers = containerRows;
 
     if (containers.length) {
       const ids = containers.map(c => c.id);
@@ -3455,30 +3688,43 @@ app.delete('/v2/assessment-batches/:id/containers', async (req, res) => {
       );
     }
 
-    // Mark batch as completed (full deprovision = batch lifecycle done)
-    await connection.query(
-      `UPDATE assessment_batches SET status = 'completed' WHERE id = ?`,
-      [batchId]
-    );
+    await syncAssessmentBatchStatus(batchId, connection);
 
     await connection.commit();
 
-    // Fire Docker cleanup for every container (async, non-blocking)
-    const framework = 'react';
-    for (const c of containers) {
-      if (c.container_identifier) {
+    const cleanupResults = await Promise.allSettled(
+      containers.map((c) =>
         runDockerCleanupForUser({
-          userId: c.container_identifier,
+          userId: c.aon_id || null,
+          logUserId: c.aon_id || null,
+          containerIdentifier: c.container_identifier || `pac${c.id}`,
           question: c.question_id,
-          framework
-        }).catch(err => {
-          console.error(`[Batch:${batchId}] ❌ Docker cleanup failed for ${c.container_identifier}: ${err.message}`);
-        });
-      }
+          framework: 'react',
+          serverNumber: c.container_server_number || 1
+        })
+      )
+    );
+
+    const failedCleanups = cleanupResults
+      .map((result, index) => ({ result, container: containers[index] }))
+      .filter(({ result }) => result.status === 'rejected')
+      .map(({ result, container }) => ({
+        container_id: container.id,
+        container_identifier: container.container_identifier || `pac${container.id}`,
+        server_number: container.container_server_number || 1,
+        error: result.reason?.message || 'Cleanup failed'
+      }));
+
+    if (failedCleanups.length) {
+      return res.status(500).json({
+        error: 'Containers marked deprovisioned, but cleanup failed on one or more servers',
+        deprovisioned_count: containers.length,
+        failed_cleanups: failedCleanups
+      });
     }
 
     res.json({
-      message: 'All containers deprovisioned - port slots released and Docker containers stopping',
+      message: 'All containers deprovisioned - port slots released and Docker containers stopped',
       deprovisioned_count: containers.length
     });
   } catch (err) {
