@@ -1911,7 +1911,10 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
           `SELECT id, docker_port, output_port FROM port_slots WHERE is_utilized = 0 ORDER BY id ASC LIMIT 1 FOR UPDATE`
         );
         if (!portSlots.length) throw new Error('No free port slots available');
-        portSlot = { ...portSlots[0], container_server_number: 1 };
+        portSlot = {
+          ...portSlots[0],
+          container_server_number: getContainerServerNumber(portSlots[0].id)
+        };
       }
 
       const launchToken = generateOpaqueToken();
@@ -2149,7 +2152,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
   // Submit final assessment and send webhook
   app.post('/v2/submit-final', async (req, res) => {
     console.log('🚀 Received final submission');
-    const { aonId, framework, outputPort, userQuestion, autoSubmit, reason, serverNumber } = req.body;
+    const { aonId, framework, outputPort, userQuestion, autoSubmit, reason, serverNumber, containerServerNumber } = req.body;
 
     if (!aonId || !framework || !userQuestion) {
       return res.status(400).json({ error: 'Missing required fields: aonId, framework, userQuestion' });
@@ -2174,7 +2177,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
         framework,
         outputPort,
         userQuestion,
-        serverNumber,
+        serverNumber: serverNumber || containerServerNumber,
         message: autoSubmitMessage,
       });
 

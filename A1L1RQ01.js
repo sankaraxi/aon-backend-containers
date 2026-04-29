@@ -27,7 +27,7 @@ async function a1l1q1(id,framework,outputPort, serverNumber = 1) {
 
   if (outputPort) {
     baseURL = serverNumber > 1 || process.env.CONTAINER_ROUTING_MODE === 'production'
-      ? `http://aws-test.starsquare.in/container-server/${serverNumber}/out/${outputPort}/`
+      ? `https://aws-test.starsquare.in/container-server/${serverNumber}/out/${outputPort}/`
       : `http://localhost:${outputPort}`;
   }
 
