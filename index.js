@@ -85,7 +85,7 @@ function buildContainerAccess({ dockerPort, outputPort, serverNumber }) {
       editor_url:
         applyTemplate(process.env.CONTAINER_EDITOR_URL_TEMPLATE, templateValues) ||
         (resolvedServerBaseUrl && dockerPort
-          ? `${resolvedServerBaseUrl}/${dockerPort}/?folder=${encodeURIComponent(CONTAINER_WORKSPACE_FOLDER)}`
+          ? `${resolvedServerBaseUrl}/ds/${dockerPort}/?folder=${encodeURIComponent(CONTAINER_WORKSPACE_FOLDER)}`
           : null),
       preview_url:
         applyTemplate(process.env.CONTAINER_PREVIEW_URL_TEMPLATE, templateValues) ||
@@ -180,8 +180,36 @@ function buildLocalProvisionCommand(container) {
   return { command, identifier, scriptPath };
 }
 
+function runContainerProvisionLocally(container) {
+  const { identifier, command, scriptPath } = buildLocalProvisionCommand(container);
+
+  return new Promise((resolve, reject) => {
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        reject({
+          identifier,
+          scriptPath,
+          command,
+          error,
+          stdout,
+          stderr
+        });
+        return;
+      }
+
+      resolve({
+        identifier,
+        scriptPath,
+        command,
+        stdout,
+        stderr
+      });
+    });
+  });
+}
+
 function dispatchProvisionedContainer(batchId, container) {
-  const { identifier, command } = buildLocalProvisionCommand(container);
+  const { identifier } = buildLocalProvisionCommand(container);
   const access = buildContainerAccess({
     dockerPort: container.docker_port,
     outputPort: container.output_port,
@@ -269,14 +297,104 @@ function dispatchProvisionedContainer(batchId, container) {
   console.log(
     `[Batch:${batchId}] Starting Docker container ${identifier} (${container.question_id}) on ports ${container.docker_port}/${container.output_port}`
   );
-  exec(command, (error) => {
-    if (error) {
-      console.error(`[Batch:${batchId}] Docker start failed for ${identifier}: ${error.message}`);
-      return;
-    }
-    console.log(`[Batch:${batchId}] Container ${identifier} started`);
-  });
+  runContainerProvisionLocally(container)
+    .then(() => {
+      console.log(`[Batch:${batchId}] Container ${identifier} started`);
+    })
+    .catch((result) => {
+      console.error(`[Batch:${batchId}] Docker start failed for ${identifier}: ${result.error.message}`);
+      if (result.stderr) {
+        console.error(`[Batch:${batchId}] Docker start stderr for ${identifier}: ${result.stderr}`);
+      }
+    });
 }
+
+app.get('/container-server/:serverNumber/health', (req, res) => {
+  const serverNumber = Number(req.params.serverNumber) || 1;
+  res.json({
+    status: 'ok',
+    server_number: serverNumber,
+    routing_mode: isProductionContainerRouting() ? 'production' : 'development',
+    provision_path: `/container-server/${serverNumber}/provision`
+  });
+});
+
+app.post('/container-server/:serverNumber/provision', async (req, res) => {
+  const serverNumber = Number(req.params.serverNumber) || 1;
+  const {
+    batch_id,
+    container_id,
+    container_identifier,
+    question_id,
+    docker_port,
+    output_port,
+    framework
+  } = req.body || {};
+
+  if (!container_id || !question_id || !docker_port || !output_port) {
+    return res.status(400).json({
+      error: 'container_id, question_id, docker_port, and output_port are required'
+    });
+  }
+
+  const container = {
+    id: container_id,
+    question_id,
+    docker_port,
+    output_port,
+    container_server_number: serverNumber
+  };
+
+  const access = buildContainerAccess({
+    dockerPort: docker_port,
+    outputPort: output_port,
+    serverNumber
+  });
+
+  console.log(
+    `[Worker:${serverNumber}] Provision request received for ${container_identifier || `pac${container_id}`} from batch ${batch_id || 'N/A'}`
+  );
+  console.log(
+    `[Worker:${serverNumber}] Deploy path: /container-server/${serverNumber}/provision question=${question_id} framework=${framework || 'react'} docker=${docker_port} output=${output_port}`
+  );
+  console.log(
+    `[Worker:${serverNumber}] Access URLs: editor=${access.editor_url || 'N/A'} preview=${access.preview_url || 'N/A'}`
+  );
+
+  try {
+    const result = await runContainerProvisionLocally(container);
+    return res.json({
+      started: true,
+      server_number: serverNumber,
+      deploy_path: `/container-server/${serverNumber}/provision`,
+      container_identifier: result.identifier,
+      script_path: result.scriptPath,
+      editor_url: access.editor_url,
+      preview_url: access.preview_url,
+      stdout: result.stdout,
+      stderr: result.stderr || null
+    });
+  } catch (result) {
+    console.error(
+      `[Worker:${serverNumber}] Local provision failed for ${container_identifier || `pac${container_id}`}: ${result.error.message}`
+    );
+    if (result.stderr) {
+      console.error(`[Worker:${serverNumber}] Local provision stderr: ${result.stderr}`);
+    }
+
+    return res.status(500).json({
+      started: false,
+      server_number: serverNumber,
+      deploy_path: `/container-server/${serverNumber}/provision`,
+      container_identifier: result.identifier,
+      script_path: result.scriptPath,
+      command: result.command,
+      error: result.error.message,
+      stdout: result.stdout || null,
+      stderr: result.stderr || null
+    });
+  }
+});
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'] || req.headers['Authorization'];
