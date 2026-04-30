@@ -3,6 +3,9 @@
 --            Separate Port Slots & Client Question Assignments
 -- ============================================================
 
+-- 0. ADD mobile_number column to students table
+ALTER TABLE `students` ADD COLUMN `mobile_number` VARCHAR(15) DEFAULT NULL AFTER `roll_number`;
+
 -- 1. CREATE businesses TABLE
 CREATE TABLE IF NOT EXISTS `businesses` (
   `business_id` INT NOT NULL AUTO_INCREMENT,

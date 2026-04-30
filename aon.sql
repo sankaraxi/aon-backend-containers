@@ -631,6 +631,7 @@ CREATE TABLE `students` (
   `id` int NOT NULL AUTO_INCREMENT,
   `name` varchar(100) DEFAULT NULL,
   `roll_number` varchar(50) DEFAULT NULL,
+  `mobile_number` varchar(15) DEFAULT NULL,
   `aon_id` varchar(100) DEFAULT NULL,
   `test_link` text,
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,

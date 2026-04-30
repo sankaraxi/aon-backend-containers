@@ -709,7 +709,20 @@ con.getConnection((error, connection) => {
     "ALTER TABLE launch_tokens ADD COLUMN container_server_number INT DEFAULT 1",
     "ALTER TABLE assessment_batches ADD COLUMN containers_per_server INT NOT NULL DEFAULT 3",
     // Extend batch status enum to include deprovisioned
-    "ALTER TABLE assessment_batches MODIFY COLUMN status ENUM('draft','active','completed','deprovisioned') NOT NULL DEFAULT 'draft'"
+    "ALTER TABLE assessment_batches MODIFY COLUMN status ENUM('draft','active','completed','deprovisioned') NOT NULL DEFAULT 'draft'",
+    // Add logged_at to user_log for timestamp-based progress tracking
+    "ALTER TABLE user_log ADD COLUMN logged_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    // log_master: upsert stage names into existing table
+    `INSERT INTO log_master (activity_code, activity) VALUES
+      (1, 'Created Test Link'),
+      (2, 'Assigned Docker Container'),
+      (3, 'Read Guidelines'),
+      (4, 'Read Question and Started Assessment'),
+      (5, 'Run Assessment Clicked'),
+      (6, 'Submitted the Assessment'),
+      (7, 'Results Sent to Webhook'),
+      (8, 'Docker Container Killed')
+    ON DUPLICATE KEY UPDATE activity = VALUES(activity)`
   ];
   for (const sql of migrations) {
     try {
@@ -720,7 +733,7 @@ con.getConnection((error, connection) => {
       }
     }
   }
-  console.log('✅ Tab enforcement columns, error_log, assessment_batches and pre_allocated_containers tables ready');
+  console.log('Tab enforcement columns, error_log, assessment_batches, pre_allocated_containers, log_master tables ready');
 })();
 
 module.exports = con;
@@ -766,15 +779,28 @@ function getDeadlineFromStoredValue(rawValue) {
   return Date.now() + remainingMs;
 }
 
+const LOG_STAGE_NAMES = {
+  1: 'Created Test Link',
+  2: 'Assigned Docker Container',
+  3: 'Read Guidelines',
+  4: 'Read Question and Started Assessment',
+  5: 'Run Assessment Clicked',
+  6: 'Submitted the Assessment',
+  7: 'Results Sent to Webhook',
+  8: 'Docker Container Killed'
+};
+
 async function insertUserLogSafe(userId, activityCode) {
   if (!userId) return;
+  const stageName = LOG_STAGE_NAMES[activityCode] || `Stage ${activityCode}`;
   try {
     await con.promise().query(
       "INSERT INTO user_log (userid, activity_code) VALUES (?, ?)",
       [userId, activityCode]
     );
+    console.log(`[${userId}] Log stage ${activityCode}: ${stageName}`);
   } catch (err) {
-    console.error(`[${userId}] ❌ Failed to insert user_log activity_code=${activityCode}: ${err.message}`);
+    console.error(`[${userId}] Failed to insert user_log stage=${activityCode} (${stageName}): ${err.message}`);
   }
 }
 
@@ -859,8 +885,8 @@ async function runDockerCleanupForUser({ userId, containerIdentifier, question, 
 
   const activityUserId = logUserId || userId;
   if (activityUserId) {
-    console.log(`[${activityUserId}] 🧹 Docker container killed — logging activity code 7`);
-    await insertUserLogSafe(activityUserId, 7);
+    console.log(`[${activityUserId}] Docker container killed — recording stage 8`);
+    await insertUserLogSafe(activityUserId, 8);
   }
 }
 
@@ -968,8 +994,8 @@ async function submitFinalAssessmentInternal({ aonId, framework, outputPort, use
     insertErrorLogSafe(aonId, 'port_slot_release', e.message);
   }
 
-  await insertUserLogSafe(aonId, 6); // Submitted the Assessment
-  console.log(`[${aonId}] 📝 Submission logged (activity code 6)`);
+  await insertUserLogSafe(aonId, 6); // Stage 6: Submitted the Assessment
+  console.log(`[${aonId}] Submission recorded — stage 6`);
 
   try {
     const cleanedContainer = await finalizeAssignedPreAllocatedContainer({
@@ -1031,15 +1057,16 @@ async function submitFinalAssessmentInternal({ aonId, framework, outputPort, use
         }
       )
       .then(() => {
-        console.log(`[${aonId}] ✅ Webhook delivered successfully`);
+        console.log(`[${aonId}] Webhook delivered successfully`);
+        insertUserLogSafe(aonId, 7); // Stage 7: Results Sent to Webhook
       })
       .catch(err => {
-        console.error(`[${aonId}] ❌ Webhook delivery failed: ${err.message}`);
+        console.error(`[${aonId}] Webhook delivery failed: ${err.message}`);
         insertErrorLogSafe(aonId, 'webhook_delivery', err.message);
       });
     }
   } catch (e) {
-    console.error(`[${aonId}] ❌ Failed to fetch/send results_webhook: ${e.message}`);
+    console.error(`[${aonId}] Failed to fetch/send results_webhook: ${e.message}`);
     insertErrorLogSafe(aonId, 'webhook_fetch', e.message);
   }
 
@@ -1308,7 +1335,9 @@ const upload = multer({ storage });
 
   app.post('/v2/run-Assesment', async (req, res) => {
     const { userId, framework, outputPort, serverNumber } = req.body;
-    console.log(`[${userId}] 🏃 Run Assessment (Q3) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
+    console.log(`[${userId}] Run Assessment (Q3) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
+    // Stage 5: Run Assessment Clicked
+    await insertUserLogSafe(userId, 5);
     try {
       const results = await a1l1q3(userId,framework, outputPort, serverNumber || 1);
       
@@ -1321,40 +1350,22 @@ const upload = multer({ storage });
       const newresult=JSON.stringify(results)
       con.query(insertcategory,[userId , newresult, newOverallResult],(error,result)=>{
           if(error){
-              console.error(`[${userId}] ❌ Results insert error: ${error.message}`)
+              console.error(`[${userId}] Results insert error: ${error.message}`)
               insertErrorLogSafe(userId, 'run_assessment_q3_save', error.message);
           }
           else{
-            console.log(`[${userId}] ✅ Assessment Q3 results saved`);
+            console.log(`[${userId}] Assessment Q3 results saved`);
           }
-      var insertcategory2="insert into user_log (userid,activity_code)values(?,?)"
-      con.query(insertcategory2,[userId , 5],(error,result)=>{
-        if(error){
-            console.error(`[${userId}] ❌ user_log insert error (code 5): ${error.message}`)
-        }
-        else{
-          console.log(`[${userId}] 📝 Run Assessment Clicked logged (activity code 5)`)
-        }
-      })
       })
 
     } catch (error) {
-      console.error(`[${userId}] ❌ Assessment Q3 error: ${error.message}`);
+      console.error(`[${userId}] Assessment Q3 error: ${error.message}`);
       insertErrorLogSafe(userId, 'run_assessment_q3', error.message);
 
       if (
         error.message?.includes('ERR_SOCKET_NOT_CONNECTED') ||
         error.message?.includes('localhost:5173')
       ) {
-        var insertcategory="insert into user_log (userid,activity_code)values(?,?)"
-        con.query(insertcategory,[userId , 5],(error,result)=>{
-          if(error){
-              console.error(`[${userId}] ❌ user_log insert error (code 5): ${error.message}`)
-          }
-          else{
-            console.log(`[${userId}] 📝 Run Assessment Clicked logged (activity code 5)`)
-          }
-        })
         return res.status(500).json({
           error: 'Frontend application is not running on port 5173. Please start it before running the assessment.'
         });
@@ -1366,7 +1377,9 @@ const upload = multer({ storage });
 
   app.post('/v2/run-Assesment-2', async (req, res) => {
     const { userId, framework, outputPort, serverNumber } = req.body;
-    console.log(`[${userId}] 🏃 Run Assessment (Q2) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
+    console.log(`[${userId}] Run Assessment (Q2) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
+    // Stage 5: Run Assessment Clicked
+    await insertUserLogSafe(userId, 5);
     try {
       const results = await a1l1q2(userId,framework, outputPort, serverNumber || 1);
       res.json({ detailedResults: results });
@@ -1378,41 +1391,22 @@ const upload = multer({ storage });
       const newresult=JSON.stringify(results)
       con.query(insertcategory,[userId , newresult, newOverallResult],(error,result)=>{
           if(error){
-              console.error(`[${userId}] ❌ Results insert error: ${error.message}`)
+              console.error(`[${userId}] Results insert error: ${error.message}`)
               insertErrorLogSafe(userId, 'run_assessment_q2_save', error.message);
           }
           else{
-            console.log(`[${userId}] ✅ Assessment Q2 results saved`);
+            console.log(`[${userId}] Assessment Q2 results saved`);
           }
-      var insertcategory2="insert into user_log (userid,activity_code)values(?,?)"
-      con.query(insertcategory2,[userId , 5],(error,result)=>{
-        if(error){
-            console.error(`[${userId}] ❌ user_log insert error (code 5): ${error.message}`)
-        }
-        else{
-          console.log(`[${userId}] 📝 Run Assessment Clicked logged (activity code 5)`)
-        }
       })
-      })
-      
 
     } catch (error) {
-      console.error(`[${userId}] ❌ Assessment Q2 error: ${error.message}`);
+      console.error(`[${userId}] Assessment Q2 error: ${error.message}`);
       insertErrorLogSafe(userId, 'run_assessment_q2', error.message);
 
       if (
         error.message?.includes('ERR_SOCKET_NOT_CONNECTED') ||
         error.message?.includes('localhost:5173')
       ) {
-        var insertcategory="insert into user_log (userid,activity_code)values(?,?)"
-        con.query(insertcategory,[userId , 5],(error,result)=>{
-          if(error){
-              console.error(`[${userId}] ❌ user_log insert error (code 5): ${error.message}`)
-          }
-          else{
-            console.log(`[${userId}] 📝 Run Assessment Clicked logged (activity code 5)`)
-          }
-        })
         return res.status(500).json({
           error: 'Frontend application is not running on port 5173. Please start it before running the assessment.'
         });
@@ -1424,7 +1418,9 @@ const upload = multer({ storage });
 
   app.post('/v2/run-Assesment-1', async (req, res) => {
     const { userId, framework, outputPort, serverNumber } = req.body;
-    console.log(`[${userId}] 🏃 Run Assessment (Q1) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
+    console.log(`[${userId}] Run Assessment (Q1) triggered — framework=${framework}, port=${outputPort}, server=${serverNumber || 1}`);
+    // Stage 5: Run Assessment Clicked
+    await insertUserLogSafe(userId, 5);
     try {
       const results = await a1l1q1(userId,framework, outputPort, serverNumber || 1);
       res.json({ detailedResults: results });
@@ -1435,41 +1431,22 @@ const upload = multer({ storage });
       const newresult=JSON.stringify(results)
       con.query(insertcategory,[userId, newresult, newOverallResult],(error,result)=>{
           if(error){
-              console.error(`[${userId}] ❌ Results insert error: ${error.message}`)
+              console.error(`[${userId}] Results insert error: ${error.message}`)
               insertErrorLogSafe(userId, 'run_assessment_q1_save', error.message);
           }
           else{
-            console.log(`[${userId}] ✅ Assessment Q1 results saved`);
+            console.log(`[${userId}] Assessment Q1 results saved`);
           }
-      var insertcategory="insert into user_log (userid,activity_code)values(?,?)"
-      con.query(insertcategory,[userId , 5],(error,result)=>{
-        if(error){
-            console.error(`[${userId}] ❌ user_log insert error (code 5): ${error.message}`)
-        }
-        else{
-          console.log(`[${userId}] 📝 Run Assessment Clicked logged (activity code 5)`)
-        }
       })
-      })
-      
 
     } catch (error) {
-      console.error(`[${userId}] ❌ Assessment Q1 error: ${error.message}`);
+      console.error(`[${userId}] Assessment Q1 error: ${error.message}`);
       insertErrorLogSafe(userId, 'run_assessment_q1', error.message);
 
       if (
         error.message?.includes('ERR_SOCKET_NOT_CONNECTED') ||
         error.message?.includes('localhost:5173')
       ) {
-        var insertcategory="insert into user_log (userid,activity_code)values(?,?)"
-        con.query(insertcategory,[userId , 5],(error,result)=>{
-          if(error){
-              console.error(`[${userId}] ❌ user_log insert error (code 5): ${error.message}`)
-          }
-          else{
-            console.log(`[${userId}] 📝 Run Assessment Clicked logged (activity code 5)`)
-          }
-        })
         return res.status(500).json({
           error: 'Frontend application is not running on port 5173. Please start it before running the assessment.'
         });
@@ -1483,13 +1460,13 @@ const upload = multer({ storage });
 
     const { userId, empNo, userName, question, framework, dockerPort, outputPort } = req.body;
 
-    // Log activity code 2 (Guidelines acknowledged)
+    // Stage 3: Read Guidelines (user clicked Acknowledge & Proceed which triggers run-script)
     const insertQuery1 = "INSERT INTO user_log (userid, activity_code) VALUES (?, ?)";
-    con.query(insertQuery1, [empNo, 2], (insertError) => {
+    con.query(insertQuery1, [empNo, 3], (insertError) => {
       if (insertError) {
-        console.error(`[${empNo}] 🔴 DB Insert Error (activity_code=2): ${insertError.message}`);
+        console.error(`[${empNo}] DB insert error stage 3 (Read Guidelines): ${insertError.message}`);
       } else {
-        console.log(`[${empNo}] 📝 Guidelines acknowledged and proceeded to next page (activity code 2)`);
+        console.log(`[${empNo}] Guidelines read and proceeded — stage 3`);
       }
     });
 
@@ -1500,10 +1477,9 @@ const upload = multer({ storage });
     );
 
     if (pacRows.length) {
-      console.log(`[${empNo}] ⚡ Pre-allocated container already running (${pacRows[0].container_identifier}) — skipping script execution`);
+      console.log(`[${empNo}] Pre-allocated container already running (${pacRows[0].container_identifier}) — skipping script execution`);
 
-      // Log activity code 3 (Docker Container Created/Ready)
-      con.query("INSERT INTO user_log (userid, activity_code) VALUES (?, ?)", [empNo, 3], () => {});
+      // Stage 2 already logged in /v2/external/assign when the PAC was assigned — do not log again here
 
       // Update user timestamps
       const issuedAt = new Date();
@@ -1516,7 +1492,7 @@ const upload = multer({ storage });
             console.error(`[${empNo}] 🔴 DB Update Error (user timestamps): ${updateError.message}`);
             return res.status(500).json({ status: "error", message: "User update failed" });
           }
-          console.log(`[${empNo}] 🟢 Pre-allocated container ready — user timestamps updated`);
+          console.log(`[${empNo}] Pre-allocated container ready — user timestamps updated`);
           return res.status(200).json({
             status: "success",
             output: "Pre-allocated container already running",
@@ -1543,15 +1519,15 @@ const upload = multer({ storage });
       ? `powershell.exe -ExecutionPolicy Bypass -File "${scriptPath}" -UserID ${userId} -EmployeeNo "${empNo}" -dockerPort ${dockerPort} -outputPort ${outputPort}`
       : `bash "${scriptPath}" "${userId}" "${empNo}" "${dockerPort}" "${outputPort}"`;
 
-    console.log(`[${empNo}] 🐳 Docker container creation initiated — question=${question}, framework=${framework}`);
-    console.log(`[${empNo}] 📦 Docker port: ${dockerPort}, Output port: ${outputPort}`);
-    console.log(`[${empNo}] 🔧 Script path: ${scriptPath}`);
-    console.log(`[${empNo}] 🚀 Executing: ${command}`);
+console.log(`[${empNo}] Docker container creation initiated — question=${question}, framework=${framework}`);
+      console.log(`[${empNo}] Docker port: ${dockerPort}, Output port: ${outputPort}`);
+      console.log(`[${empNo}] Script path: ${scriptPath}`);
+      console.log(`[${empNo}] Executing: ${command}`);
 
     exec(command, (error, stdout, stderr) => {
 
       if (error) {
-        console.error(`[${empNo}] ❌ Docker container creation failed: ${error.message}`);
+        console.error(`[${empNo}] Docker container creation failed: ${error.message}`);
         insertErrorLogSafe(empNo, 'docker_create', error.message, stderr || null);
         return res.status(500).json({
           status: "error",
@@ -1561,26 +1537,26 @@ const upload = multer({ storage });
       }
 
       if (stderr) {
-        console.warn(`[${empNo}] ⚠️  Docker create stderr: ${stderr.trim()}`);
+        console.warn(`[${empNo}] Docker create stderr: ${stderr.trim()}`);
       }
 
-      console.log(`[${empNo}] ✅ Docker creation output:\n${stdout.trim()}`);
+      console.log(`[${empNo}] Docker creation output:\n${stdout.trim()}`);
 
-      // Insert log: Docker Container Created (code 3)
+      // Stage 2: Assigned Docker Container (container created on-demand)
       const insertQuery =
         "INSERT INTO user_log (userid, activity_code) VALUES (?, ?)";
 
-      con.query(insertQuery, [empNo, 3], (insertError) => {
+      con.query(insertQuery, [empNo, 2], (insertError) => {
 
         if (insertError) {
-          console.error(`[${empNo}] 🔴 DB Insert Error (activity_code=3): ${insertError.message}`);
+          console.error(`[${empNo}] DB insert error stage 2 (Assigned Docker Container): ${insertError.message}`);
           return res.status(500).json({
             status: "error",
             message: "Activity log insert failed"
           });
         }
 
-        console.log(`[${empNo}] 📝 Docker Container Created logged (activity code 3)`);
+        console.log(`[${empNo}] Docker container created and assigned — stage 2`);
 
         // Update user timestamps
         const updateQuery =
@@ -1592,14 +1568,14 @@ const upload = multer({ storage });
         con.query(updateQuery, [issuedAt, expiresAt, userId], (updateError) => {
 
           if (updateError) {
-            console.error(`[${empNo}] 🔴 DB Update Error (user timestamps): ${updateError.message}`);
+            console.error(`[${empNo}] DB update error (user timestamps): ${updateError.message}`);
             return res.status(500).json({
               status: "error",
               message: "User update failed"
             });
           }
 
-          console.log(`[${empNo}] 🟢 Docker container is up and ready — user timestamps updated`);
+          console.log(`[${empNo}] Docker container is up and ready — user timestamps updated`);
 
           return res.status(200).json({
             status: "success",
@@ -1643,7 +1619,7 @@ const upload = multer({ storage });
       if (question && framework) {
         await runDockerCleanupForUser({ userId, question, framework });
       } else {
-        await insertUserLogSafe(userId, 7);
+        await insertUserLogSafe(userId, 8); // Stage 8: Docker Container Killed
       }
 
       return res.status(200).json({ status: 'success', message: 'Docker cleanup completed' });
@@ -1998,7 +1974,7 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
 
         resolvedClientId = clientCheck[0].client_id;
         businessId = clientCheck[0].business_id;
-        console.log(`[${aon_id}] 🏢 Using client: ${clientCheck[0].client_name} (ID: ${resolvedClientId})`);
+        console.log(`[${aon_id}] Using client: ${clientCheck[0].client_name} (ID: ${resolvedClientId})`);
 
         // Check business subscription limit
         if (businessId) {
@@ -2117,7 +2093,7 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
         }
       }
 
-      console.log(`[${aon_id}] 📋 Question: ${selectedQuestion}`);
+      console.log(`[${aon_id}] Question: ${selectedQuestion}`);
 
       // Increment subscription usage
       if (resolvedClientId && businessId) {
@@ -2170,9 +2146,15 @@ app.post('/v2/external/assign',basicAuth, async (req, res) => {
         [test.id, aon_id, 'Assigned', session_id, test_link, client_id || null]
       );
 
-      // Log: Created Test Link (code 1)
+      // Stage 1: Created Test Link
       await insertUserLogSafe(aon_id, 1);
-      console.log(`[${aon_id}] ✅ Test link created: ${test_link}`);
+      console.log(`[${aon_id}] Test link created: ${test_link}`);
+
+      // Stage 2: Assigned Docker Container — only when a pre-allocated container was assigned
+      if (portSlotAlreadyUtilized) {
+        await insertUserLogSafe(aon_id, 2);
+        console.log(`[${aon_id}] Docker container assigned (pre-allocated slot) — stage 2`);
+      }
 
       return res.json({
         aon_id,
@@ -2277,11 +2259,11 @@ app.get("/v2/aon/resolve", async (req, res) => {
     }
 
     try {
-      await insertUserLogSafe(aonId, 2); // Acknowledged and Proceeded
-      console.log(`[${aonId}] ✅ Candidate acknowledged and proceeded`);
+      await insertUserLogSafe(aonId, 3); // Stage 3: Read Guidelines
+      console.log(`[${aonId}] Guidelines acknowledged and proceeded — stage 3`);
       return res.json({ success: true, message: "Acknowledgement recorded" });
     } catch (err) {
-      console.error(`[${aonId}] ❌ Acknowledge log failed: ${err.message}`);
+      console.error(`[${aonId}] Acknowledge log failed: ${err.message}`);
       insertErrorLogSafe(aonId, 'acknowledge', err.message);
       return res.status(500).json({ success: false, error: "Failed to record acknowledgement" });
     }
@@ -2309,7 +2291,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
       const aonId = rows[0].aon_id;
       const deadlineMs = getDeadlineFromStoredValue(rows[0].closing_time_ms);
 
-      console.log(`[${aonId}] 🖥️  Workspace started — framework=${framework}, url=${workspaceUrl || 'N/A'}`);
+      console.log(`[${aonId}] Workspace started — framework=${framework}, url=${workspaceUrl || 'N/A'}`);
 
       await con.promise().query(
         `UPDATE launch_tokens 
@@ -2322,8 +2304,8 @@ app.get("/v2/aon/resolve", async (req, res) => {
         [workspaceUrl || null, framework || null, deadlineMs, launchTokenId]
       );
 
-      await insertUserLogSafe(aonId, 4); // Started the Assessment
-      console.log(`[${aonId}] 📝 Assessment started logged (activity code 4)`);
+      await insertUserLogSafe(aonId, 4); // Stage 4: Read Question and Started Assessment
+      console.log(`[${aonId}] Assessment workspace opened — stage 4`);
 
       return res.json({ success: true, message: "Workspace started tracking updated" });
     } catch (err) {
@@ -2644,7 +2626,7 @@ app.get("/v2/aon/resolve", async (req, res) => {
           );
         }
       } catch (e) {
-        console.error(`[${aonId}] ❌ Failed to deprovision assigned container after no-assessment submission: ${e.message}`);
+        console.error(`[${aonId}] Failed to deprovision assigned container after no-assessment submission: ${e.message}`);
         insertErrorLogSafe(aonId, 'assigned_container_cleanup', e.message);
       }
 
@@ -2689,8 +2671,11 @@ app.get("/v2/aon/resolve", async (req, res) => {
               timeout: 5000,
             }
           )
-          .then(() => console.log("✅ No-assessment webhook delivered for", aonId))
-          .catch(err => console.error("❌ No-assessment webhook failed:", err.message));
+          .then(() => {
+            console.log(`[${aonId}] No-assessment webhook delivered — stage 7`);
+            insertUserLogSafe(aonId, 7); // Stage 7: Results Sent to Webhook
+          })
+          .catch(err => console.error(`[${aonId}] No-assessment webhook failed: ${err.message}`));
         }
       } catch (e) {
         console.error("Failed to send no-assessment webhook for aonId", aonId, e.message);
@@ -2972,21 +2957,25 @@ app.post('/v2/aon/release-tab', async (req, res) => {
 
 // New Home Page
 app.post("/v2/generate-test-link", async (req, res) => {
-  const { name, rollNumber } = req.body;
+  const { name, rollNumber, mobileNumber } = req.body;
 
-  if (!name || !rollNumber) {
+  if (!name || !rollNumber || !mobileNumber) {
     return res.status(400).json({ message: "Missing fields" });
+  }
+
+  if (!/^[6-9]\d{9}$/.test(mobileNumber)) {
+    return res.status(422).json({ message: "Invalid mobile number. Must be a valid 10-digit Indian mobile number." });
   }
 
   const aon_id = `AON-${rollNumber}`;
 
   try {
     const response = await axios.post(
-      "https://aws-test.starsquare.in/api/v2/external/assign",
+      `${process.env.TEST_LINK_DYNAMIC_API_BASE_URL}/v2/external/assign`,
       {
         session_id: "AON-SESSION-LOADTEST",
         aon_id,
-        client_id: "LOAD_TEST",
+        client_id: "CLIENT_B",
         redirect_url: "https://cocubes.com/logout&link=0&rand=1#completed",
         results_webhook: "https://pulpitless-seclusively-ilona.ngrok-free.dev/webhook",
       },
@@ -3013,8 +3002,8 @@ app.post("/v2/generate-test-link", async (req, res) => {
     }
 
     con.query(
-      "INSERT INTO students (name, roll_number, aon_id, test_link) VALUES (?, ?, ?, ?)",
-      [name, rollNumber, aon_id, test_link],
+      "INSERT INTO students (name, roll_number, mobile_number, aon_id, test_link) VALUES (?, ?, ?, ?, ?)",
+      [name, rollNumber, mobileNumber, aon_id, test_link],
       (err) => {
         if (err) {
           console.error("DB insert error:", err);
@@ -3749,6 +3738,150 @@ app.delete('/v2/assessment-batches/:id/containers', async (req, res) => {
     res.status(500).json({ error: 'Failed to deprovision containers' });
   } finally {
     if (connection) connection.release();
+  }
+});
+
+// ========== BATCH PROGRESS TRACKER (SuperAdmin real-time) ==========
+
+// GET /v2/superadmin/batch-progress/:batchId
+// Returns all assigned users in a batch with their log stages and run-assessment counts.
+app.get('/v2/superadmin/batch-progress/:batchId', async (req, res) => {
+  const batchId = req.params.batchId;
+
+  try {
+    // Batch metadata
+    const [batches] = await con.promise().query(
+      `SELECT ab.id, ab.batch_name, ab.status, ab.estimated_users,
+              ab.containers_per_server, ab.created_at,
+              c.client_name, b.business_name
+       FROM assessment_batches ab
+       LEFT JOIN clients c ON c.client_id = ab.client_id
+       LEFT JOIN businesses b ON b.business_id = ab.business_id
+       WHERE ab.id = ?`,
+      [batchId]
+    );
+
+    if (!batches.length) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    // All assigned containers in this batch
+    const [containers] = await con.promise().query(
+      `SELECT pac.aon_id, pac.container_identifier, pac.is_assigned,
+              pac.is_deprovisioned, pac.assigned_at, pac.question_id,
+              pac.docker_port, pac.output_port, pac.container_server_number
+       FROM pre_allocated_containers pac
+       WHERE pac.batch_id = ? AND pac.is_assigned = 1
+       ORDER BY pac.assigned_at ASC, pac.id ASC`,
+      [batchId]
+    );
+
+    if (!containers.length) {
+      return res.json({
+        batch: batches[0],
+        users: [],
+        summary: {
+          total_assigned: 0,
+          stage_counts: {},
+          total_run_assessment_clicks: 0
+        }
+      });
+    }
+
+    const aonIds = containers.map(c => c.aon_id).filter(Boolean);
+
+    let logsByUser = {};
+    if (aonIds.length) {
+      // Distinct stages per user + run assessment click count
+      const [logs] = await con.promise().query(
+        `SELECT
+           ul.userid,
+           GROUP_CONCAT(DISTINCT ul.activity_code ORDER BY ul.activity_code SEPARATOR ',') AS stages_csv,
+           SUM(CASE WHEN ul.activity_code = 5 THEN 1 ELSE 0 END) AS run_assessment_count,
+           MAX(ul.log_id) AS last_log_id
+         FROM user_log ul
+         WHERE ul.userid IN (?)
+         GROUP BY ul.userid`,
+        [aonIds]
+      );
+
+      for (const row of logs) {
+        const stages = row.stages_csv
+          ? row.stages_csv.split(',').map(Number).filter(n => n > 0)
+          : [];
+        logsByUser[row.userid] = {
+          stages,
+          run_assessment_count: Number(row.run_assessment_count) || 0
+        };
+      }
+    }
+
+    const LOG_STAGE_LABELS = {
+      1: 'Created Test Link',
+      2: 'Assigned Docker Container',
+      3: 'Read Guidelines',
+      4: 'Read Question and Started Assessment',
+      5: 'Run Assessment Clicked',
+      6: 'Submitted the Assessment',
+      7: 'Results Sent to Webhook',
+      8: 'Docker Container Killed'
+    };
+
+    const users = containers.map(c => {
+      const userLog = logsByUser[c.aon_id] || { stages: [], run_assessment_count: 0 };
+      const currentStage = userLog.stages.length ? Math.max(...userLog.stages) : 0;
+      return {
+        aon_id: c.aon_id,
+        container_identifier: c.container_identifier,
+        question_id: c.question_id,
+        is_deprovisioned: c.is_deprovisioned,
+        assigned_at: c.assigned_at,
+        stages: userLog.stages,
+        current_stage: currentStage,
+        current_stage_name: LOG_STAGE_LABELS[currentStage] || 'Not Started',
+        run_assessment_count: userLog.run_assessment_count
+      };
+    });
+
+    // Aggregate counts per stage and total run-assessment clicks
+    const stageCounts = {};
+    let totalRunAssessmentClicks = 0;
+    for (const user of users) {
+      for (const stage of user.stages) {
+        stageCounts[stage] = (stageCounts[stage] || 0) + 1;
+      }
+      totalRunAssessmentClicks += user.run_assessment_count;
+    }
+
+    console.log(`[Batch:${batchId}] Progress tracker fetched — ${users.length} assigned users`);
+
+    return res.json({
+      batch: batches[0],
+      users,
+      log_stage_labels: LOG_STAGE_LABELS,
+      summary: {
+        total_assigned: containers.length,
+        stage_counts: stageCounts,
+        total_run_assessment_clicks: totalRunAssessmentClicks
+      }
+    });
+
+  } catch (err) {
+    console.error(`[Batch:${batchId}] Error fetching batch progress: ${err.message}`);
+    return res.status(500).json({ error: 'Failed to fetch batch progress', details: err.message });
+  }
+});
+
+// GET /v2/log-master — returns log stage definitions
+app.get('/v2/log-master', async (req, res) => {
+  try {
+    const [rows] = await con.promise().query(
+      'SELECT activity_code, activity FROM log_master ORDER BY activity_code'
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching log_master:', err);
+    res.status(500).json({ error: 'Failed to fetch log stages' });
   }
 });
 
